@@ -5,7 +5,7 @@ from scipy.fftpack import fft
 from scipy import signal
 from tqdm import tqdm
 
-from args import Path
+from config import Path
 
 
 def get_npy_file_list(path_array):
@@ -208,7 +208,7 @@ from scipy.fftpack import fft
 from scipy import signal
 from tqdm import tqdm
 
-from args import Path
+from config import Path
 
 
 def data_array_concat(path_array):

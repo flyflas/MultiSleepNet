@@ -16,9 +16,9 @@ from sklearn.model_selection import StratifiedKFold
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
-from model_transformer_cross_c import Transformer
+from model import Transformer
 from data_loader import data_generator
-from args import Config, Path
+from config import Config, Path
 
 
 CLASS_NAMES = ['Wake', 'N1', 'N2', 'N3', 'REM']

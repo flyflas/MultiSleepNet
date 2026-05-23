@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-from args import Config
+from config import Config
 
 
 def print_label_distribution(labels, split_name='labels'):
@@ -26,7 +26,7 @@ def print_label_distribution(labels, split_name='labels'):
 def data_generator(path_labels, path_dataset):
     config = Config()
 
-    # 1. 一定要排序，保证和 data_preprocess_TF.py 的拼接顺序一致
+    # 1. 一定要排序，保证和 preprocess_tf.py 的拼接顺序一致
     label_files = sorted([f for f in os.listdir(path_labels) if f.endswith('.npy')])
 
     print('[INFO] label files (first 10):')
@@ -101,7 +101,7 @@ def data_generator(path_labels, path_dataset):
 
 if __name__ == '__main__':
     # 方便单独测试
-    from args import Path
+    from config import Path
 
     path = Path()
     data_generator(path_labels=path.path_labels, path_dataset=path.path_TF)
@@ -116,7 +116,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-from args import Config, Path
+from config import Config, Path
 
 
 def data_generator(path_labels, path_dataset):

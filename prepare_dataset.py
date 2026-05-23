@@ -4,7 +4,7 @@ import shutil
 import mne
 import numpy as np
 
-from args import Path
+from config import Path
 
 
 def prepare_SleepEDF_20(path_PSG, path_hypnogram, save_path):

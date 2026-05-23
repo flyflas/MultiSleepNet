@@ -11,10 +11,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
 
-from model_transformer_cross_c import Transformer
-from early_stop_tool import EarlyStopping
+from model import Transformer
+from early_stopping import EarlyStopping
 from data_loader import data_generator
-from args import Config, Path
+from config import Config, Path
 
 
 def set_random_seed(seed=0):
