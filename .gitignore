@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# UV
+.venv/
+uv.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Model checkpoints & outputs
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.keras
+*.onnx
+output/
+checkpoints/
+logs/
+runs/
+save/
+saved/
+
+# Data files (raw/processed)
+data/
+*.npz
+*.npy
+*.mat
+*.csv
+*.tsv
+
+# TensorBoard / experiment tracking
+lightning_logs/
+mlruns/
+wandb/
+
+# Environment & config
+.env
+.env.*
+!.env.example
+
+# System
+Thumbs.db
+
+# AI Agent
+.codex
