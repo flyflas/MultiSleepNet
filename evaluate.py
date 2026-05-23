@@ -11,17 +11,17 @@ from sklearn.metrics import (
     balanced_accuracy_score,
 )
 
-from sklearn.model_selection import StratifiedKFold
-
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
 from model import Transformer
 from data_loader import data_generator
 from config import Config, Path
+from mlflow_utils import MLflowTracker
 
 
 CLASS_NAMES = ['Wake', 'N1', 'N2', 'N3', 'REM']
+SPLIT_METADATA_FILE = 'split_metadata.npz'
 
 
 def specificity(y_true, y_pred, n=5):
@@ -83,6 +83,97 @@ def print_class_wise_result(class_wise_result, class_names=CLASS_NAMES):
     for i, name in enumerate(class_names):
         precision, recall, f1, spec, support = class_wise_result[i]
         print(f'{name:<8} {precision:>10.4f} {recall:>10.4f} {f1:>10.4f} {spec:>10.4f} {int(support):>10}')
+
+
+def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir='./Kfold_models/evaluation'):
+    os.makedirs(output_dir, exist_ok=True)
+
+    confusion_path = os.path.join(output_dir, 'confusion_matrix.npy')
+    class_wise_path = os.path.join(output_dir, 'class_wise_metrics.npy')
+    class_wise_csv_path = os.path.join(output_dir, 'class_wise_metrics.csv')
+
+    np.save(confusion_path, confusion_mat)
+    np.save(class_wise_path, class_wise_result)
+
+    header = 'class,precision,recall,f1,specificity,support'
+    rows = []
+    for i, class_name in enumerate(CLASS_NAMES):
+        precision, recall, f1, spec, support = class_wise_result[i]
+        rows.append(f'{class_name},{precision},{recall},{f1},{spec},{int(support)}')
+    with open(class_wise_csv_path, 'w', encoding='utf-8') as f:
+        f.write(header + '\n')
+        f.write('\n'.join(rows))
+        f.write('\n')
+
+    return [confusion_path, class_wise_path, class_wise_csv_path]
+
+
+def find_trained_fold_dirs(root='./Kfold_models'):
+    if not os.path.isdir(root):
+        return []
+
+    fold_dirs = []
+    for name in os.listdir(root):
+        if not name.startswith('fold'):
+            continue
+        suffix = name[len('fold'):]
+        if not suffix.isdigit():
+            continue
+        fold = int(suffix)
+        fold_dir = os.path.join(root, name)
+        if os.path.exists(os.path.join(fold_dir, 'model.pkl')):
+            fold_dirs.append((fold, fold_dir))
+
+    return sorted(fold_dirs, key=lambda item: item[0])
+
+
+def load_split_metadata(fold, fold_dir, config, dataset, labels):
+    metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
+    if not os.path.exists(metadata_path):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} is missing {SPLIT_METADATA_FILE}. '
+            'Refusing to evaluate because the trained test split cannot be verified.'
+        )
+
+    metadata = np.load(metadata_path)
+    required_keys = {
+        'fold_index',
+        'num_fold',
+        'random_state',
+        'shuffle',
+        'test_idx',
+        'dataset_shape',
+        'labels_shape',
+    }
+    missing_keys = sorted(required_keys - set(metadata.files))
+    if missing_keys:
+        raise RuntimeError(f'[ERROR] fold {fold} split metadata is missing keys: {missing_keys}')
+
+    metadata_fold = int(metadata['fold_index'])
+    metadata_num_fold = int(metadata['num_fold'])
+    metadata_dataset_shape = tuple(int(v) for v in metadata['dataset_shape'])
+    metadata_labels_shape = tuple(int(v) for v in metadata['labels_shape'])
+    test_idx = np.asarray(metadata['test_idx'], dtype=np.int64)
+
+    if metadata_fold != fold:
+        raise RuntimeError(f'[ERROR] fold directory fold{fold} contains metadata for fold{metadata_fold}.')
+    if metadata_num_fold != config.num_fold:
+        raise RuntimeError(
+            f'[ERROR] fold {fold} was trained with num_fold={metadata_num_fold}, '
+            f'but current config.num_fold={config.num_fold}. Refusing to evaluate mixed split definitions.'
+        )
+    if metadata_dataset_shape != tuple(dataset.shape):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} dataset shape mismatch: trained={metadata_dataset_shape}, current={tuple(dataset.shape)}.'
+        )
+    if metadata_labels_shape != tuple(labels.shape):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} labels shape mismatch: trained={metadata_labels_shape}, current={tuple(labels.shape)}.'
+        )
+    if len(test_idx) == 0 or np.any(test_idx < 0) or np.any(test_idx >= len(labels)):
+        raise RuntimeError(f'[ERROR] fold {fold} metadata has invalid test_idx bounds.')
+
+    return test_idx
 
 
 def test(model, test_loader, config):
@@ -158,71 +249,114 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
     return result
 
 
-def evaluate(config, path):
+def evaluate(config, path, tracker=None):
+    if tracker is None:
+        tracker = MLflowTracker(config)
+
     dataset, labels, _ = data_generator(
         path_labels=path.path_labels,
         path_dataset=path.path_TF
     )
 
-    kf = StratifiedKFold(n_splits=config.num_fold, shuffle=True, random_state=0)
+    with tracker.start_run(run_name=config.mlflow_run_name or 'evaluate') as _:
+        tracker.log_params({
+            'num_fold': config.num_fold,
+            'num_classes': config.num_classes,
+            'batch_size': config.batch_size,
+            'dataset_shape': tuple(dataset.shape),
+            'labels_shape': tuple(labels.shape),
+            'dataset_size': len(labels),
+            'device': config.device,
+        })
 
-    ACC = 0.0
-    Kappa = 0.0
-    MF1 = 0.0
-    WF1 = 0.0
-    Sens = 0.0
-    Spec = 0.0
-    Bal_ACC = 0.0
-    Confusion_mat = np.zeros([5, 5], dtype=np.float64)
+        ACC = 0.0
+        Kappa = 0.0
+        MF1 = 0.0
+        WF1 = 0.0
+        Sens = 0.0
+        Spec = 0.0
+        Bal_ACC = 0.0
+        Confusion_mat = np.zeros([5, 5], dtype=np.float64)
 
-    valid_folds = []
+        valid_folds = []
 
-    for fold, (_, test_idx) in enumerate(kf.split(dataset, labels)):
-        path_model = f'./Kfold_models/fold{fold}/model.pkl'
-        if not os.path.exists(path_model):
-            print(f'[SKIP] fold {fold} model not found')
-            continue
+        trained_folds = find_trained_fold_dirs()
+        if len(trained_folds) == 0:
+            raise RuntimeError('[ERROR] No trained fold models found.')
 
-        print('\n' + '-' * 15, '>', f'Fold {fold}', '<', '-' * 15)
+        for fold, fold_dir in trained_folds:
+            test_idx = load_split_metadata(fold, fold_dir, config, dataset, labels)
 
-        (
-            accuracy,
-            cohens_kappa,
-            macro_f1,
-            weighted_f1,
-            average_sensitivity,
-            average_specificity,
-            balanced_acc,
-            con_mat,
-            _
-        ) = evaluate_single_fold(config, dataset, labels, fold, test_idx)
+            print('\n' + '-' * 15, '>', f'Fold {fold}', '<', '-' * 15)
 
-        ACC += accuracy
-        Kappa += cohens_kappa
-        MF1 += macro_f1
-        WF1 += weighted_f1
-        Sens += average_sensitivity
-        Spec += average_specificity
-        Bal_ACC += balanced_acc
-        Confusion_mat += con_mat
+            (
+                accuracy,
+                cohens_kappa,
+                macro_f1,
+                weighted_f1,
+                average_sensitivity,
+                average_specificity,
+                balanced_acc,
+                con_mat,
+                class_wise_fold
+            ) = evaluate_single_fold(config, dataset, labels, fold, test_idx)
 
-        valid_folds.append(fold)
+            tracker.log_metrics({
+                f'fold_{fold}_acc': accuracy,
+                f'fold_{fold}_kappa': cohens_kappa,
+                f'fold_{fold}_macro_f1': macro_f1,
+                f'fold_{fold}_weighted_f1': weighted_f1,
+                f'fold_{fold}_sensitivity_macro_recall': average_sensitivity,
+                f'fold_{fold}_specificity': average_specificity,
+                f'fold_{fold}_balanced_accuracy': balanced_acc,
+            })
 
-    if len(valid_folds) == 0:
-        raise RuntimeError('[ERROR] No trained fold models found.')
+            fold_artifact_dir = f'./Kfold_models/fold{fold}/evaluation'
+            fold_artifacts = save_evaluation_artifacts(con_mat, class_wise_fold, output_dir=fold_artifact_dir)
+            for artifact_path in fold_artifacts:
+                tracker.log_artifact(artifact_path, artifact_path=f'fold{fold}/evaluation')
 
-    num_valid = len(valid_folds)
-    ACC /= num_valid
-    Kappa /= num_valid
-    MF1 /= num_valid
-    WF1 /= num_valid
-    Sens /= num_valid
-    Spec /= num_valid
-    Bal_ACC /= num_valid
+            ACC += accuracy
+            Kappa += cohens_kappa
+            MF1 += macro_f1
+            WF1 += weighted_f1
+            Sens += average_sensitivity
+            Spec += average_specificity
+            Bal_ACC += balanced_acc
+            Confusion_mat += con_mat
 
-    class_wise_result = class_wise_evaluate(Confusion_mat)
+            valid_folds.append(fold)
 
-    return ACC, Kappa, MF1, WF1, Sens, Spec, Bal_ACC, Confusion_mat, class_wise_result, valid_folds
+        if len(valid_folds) == 0:
+            raise RuntimeError('[ERROR] No trained fold models found.')
+
+        num_valid = len(valid_folds)
+        ACC /= num_valid
+        Kappa /= num_valid
+        MF1 /= num_valid
+        WF1 /= num_valid
+        Sens /= num_valid
+        Spec /= num_valid
+        Bal_ACC /= num_valid
+
+        class_wise_result = class_wise_evaluate(Confusion_mat)
+
+        tracker.log_metrics({
+            'mean_acc': ACC,
+            'mean_kappa': Kappa,
+            'mean_macro_f1': MF1,
+            'mean_weighted_f1': WF1,
+            'mean_sensitivity_macro_recall': Sens,
+            'mean_specificity': Spec,
+            'mean_balanced_accuracy': Bal_ACC,
+            'num_valid_folds': num_valid,
+        })
+
+        artifact_paths = save_evaluation_artifacts(Confusion_mat, class_wise_result)
+        for artifact_path in artifact_paths:
+            tracker.log_artifact(artifact_path, artifact_path='evaluation')
+
+        return ACC, Kappa, MF1, WF1, Sens, Spec, Bal_ACC, Confusion_mat, class_wise_result, valid_folds
 
 
 if __name__ == '__main__':

@@ -57,6 +57,14 @@ class Config(object):
         self.print_distribution_first_n_epochs = 3
         self.print_distribution_every = 10
 
+        # mlflow
+        self.mlflow_tracking_uri = os.getenv('MLFLOW_TRACKING_URI', '').strip()
+        self.mlflow_tracking_username = os.getenv('MLFLOW_TRACKING_USERNAME', '').strip()
+        self.mlflow_tracking_password = os.getenv('MLFLOW_TRACKING_PASSWORD', '').strip()
+        self.mlflow_tracking_token = os.getenv('MLFLOW_TRACKING_TOKEN', '').strip()
+        self.mlflow_experiment_name = os.getenv('MLFLOW_EXPERIMENT_NAME', 'MultiChannelSleepNet').strip()
+        self.mlflow_run_name = os.getenv('MLFLOW_RUN_NAME', '').strip()
+
 
 class Path(object):
     """path of files in this project"""

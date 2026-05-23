@@ -15,6 +15,12 @@ from model import Transformer
 from early_stopping import EarlyStopping
 from data_loader import data_generator
 from config import Config, Path
+from mlflow_utils import MLflowTracker
+
+
+SPLIT_METADATA_FILE = 'split_metadata.npz'
+SPLIT_RANDOM_STATE = 0
+SPLIT_SHUFFLE = True
 
 
 def set_random_seed(seed=0):
@@ -37,6 +43,89 @@ def print_label_distribution(labels, split_name='dataset'):
     print(f'\n[{split_name}] label distribution:')
     for u, c in zip(unique, counts):
         print(f'  class {u}: {c} ({c / total:.6f})')
+
+
+def label_distribution(labels):
+    if isinstance(labels, torch.Tensor):
+        labels = labels.cpu().numpy()
+
+    unique, counts = np.unique(labels, return_counts=True)
+    return {f'class_{int(u)}': int(c) for u, c in zip(unique, counts)}
+
+
+def log_config_params(tracker, config):
+    tracker.log_params({
+        'num_fold': config.num_fold,
+        'num_classes': config.num_classes,
+        'num_epochs': config.num_epochs,
+        'batch_size': config.batch_size,
+        'pad_size': config.pad_size,
+        'learning_rate': config.learning_rate,
+        'dropout': config.dropout,
+        'dim_model': config.dim_model,
+        'forward_hidden': config.forward_hidden,
+        'fc_hidden': config.fc_hidden,
+        'num_head': config.num_head,
+        'num_encoder': config.num_encoder,
+        'num_encoder_multi': config.num_encoder_multi,
+        'use_positional_encoding': config.use_positional_encoding,
+        'mamba_d_state': config.mamba_d_state,
+        'mamba_d_conv': config.mamba_d_conv,
+        'mamba_expand': config.mamba_expand,
+        'label_smoothing': config.label_smoothing,
+        'weight_decay': config.weight_decay,
+        'grad_clip': config.grad_clip,
+        'early_stop_patience': config.early_stop_patience,
+        'early_stop_delta': config.early_stop_delta,
+        'device': config.device,
+    })
+
+
+def log_fold_artifacts(tracker, fold_dir):
+    for filename in os.listdir(fold_dir):
+        if filename.endswith(('.pkl', '.npy', '.npz')):
+            tracker.log_artifact(os.path.join(fold_dir, filename), artifact_path=os.path.basename(fold_dir))
+
+
+def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels):
+    np.savez(
+        os.path.join(fold_dir, SPLIT_METADATA_FILE),
+        fold_index=np.array(fold, dtype=np.int64),
+        num_fold=np.array(config.num_fold, dtype=np.int64),
+        random_state=np.array(SPLIT_RANDOM_STATE, dtype=np.int64),
+        shuffle=np.array(SPLIT_SHUFFLE, dtype=np.bool_),
+        train_idx=np.asarray(train_idx, dtype=np.int64),
+        test_idx=np.asarray(test_idx, dtype=np.int64),
+        dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
+        labels_shape=np.asarray(labels.shape, dtype=np.int64),
+    )
+
+
+def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels):
+    metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
+    if not os.path.exists(metadata_path):
+        raise RuntimeError(
+            f'[ERROR] Existing fold {fold} is missing {SPLIT_METADATA_FILE}. '
+            'Refusing to treat it as complete because its test split cannot be verified.'
+        )
+
+    metadata = np.load(metadata_path)
+    checks = {
+        'fold_index': int(metadata['fold_index']) == fold,
+        'num_fold': int(metadata['num_fold']) == config.num_fold,
+        'random_state': int(metadata['random_state']) == SPLIT_RANDOM_STATE,
+        'shuffle': bool(metadata['shuffle']) == SPLIT_SHUFFLE,
+        'train_idx': np.array_equal(metadata['train_idx'], np.asarray(train_idx, dtype=np.int64)),
+        'test_idx': np.array_equal(metadata['test_idx'], np.asarray(test_idx, dtype=np.int64)),
+        'dataset_shape': np.array_equal(metadata['dataset_shape'], np.asarray(dataset.shape, dtype=np.int64)),
+        'labels_shape': np.array_equal(metadata['labels_shape'], np.asarray(labels.shape, dtype=np.int64)),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(
+            f'[ERROR] Existing fold {fold} split metadata is incompatible with the current split '
+            f'({", ".join(failed)} mismatch). Use a separate Kfold_models directory or regenerate folds.'
+        )
 
 
 def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
@@ -107,8 +196,19 @@ def is_fold_finished(fold_dir: str) -> bool:
         'test_ACC.npy',
         'val_LOSS.npy',
         'val_ACC.npy',
+        'model.pkl',
+        SPLIT_METADATA_FILE,
     ]
     return all(os.path.exists(os.path.join(fold_dir, f)) for f in required_files)
+
+
+def has_fold_outputs(fold_dir: str) -> bool:
+    if not os.path.isdir(fold_dir):
+        return False
+    return any(
+        name.endswith(('.pkl', '.npy')) or name == SPLIT_METADATA_FILE
+        for name in os.listdir(fold_dir)
+    )
 
 
 def find_first_unfinished_fold(num_fold: int, root='./Kfold_models') -> int:
@@ -126,6 +226,7 @@ def find_first_unfinished_fold(num_fold: int, root='./Kfold_models') -> int:
 def train(save_all_checkpoint=False, start_fold=None):
     config = Config()
     path = Path()
+    tracker = MLflowTracker(config)
 
     print(f'[INFO] device = {config.device}')
     print(f'[INFO] batch_size = {config.batch_size}')
@@ -144,7 +245,7 @@ def train(save_all_checkpoint=False, start_fold=None):
     kf = StratifiedKFold(
         n_splits=config.num_fold,
         shuffle=True,
-        random_state=0
+        random_state=SPLIT_RANDOM_STATE
     )
 
     # 自动找未完成 fold
@@ -155,158 +256,229 @@ def train(save_all_checkpoint=False, start_fold=None):
 
     print(f'[INFO] resume start fold = {start_fold}')
 
-    if start_fold >= config.num_fold:
-        print('[INFO] All folds are already finished. Nothing to do.')
-        return
+    with tracker.start_run(run_name=config.mlflow_run_name or 'train') as _:
+        log_config_params(tracker, config)
+        tracker.log_params({
+            'dataset_shape': tuple(dataset.shape),
+            'labels_shape': tuple(labels.shape),
+            'dataset_size': len(labels),
+            'save_all_checkpoint': save_all_checkpoint,
+            'start_fold': start_fold,
+        })
+        tracker.log_params({f'full_distribution_{k}': v for k, v in label_distribution(labels).items()})
 
-    for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
-        fold_dir = f'./Kfold_models/fold{fold}'
-        os.makedirs(fold_dir, exist_ok=True)
+        any_fold_trained = False
 
-        # 1) 小于 start_fold 的一律跳过
-        if fold < start_fold:
-            print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
-            continue
+        for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
+            fold_dir = f'./Kfold_models/fold{fold}'
+            os.makedirs(fold_dir, exist_ok=True)
 
-        # 2) 如果该 fold 已完整完成，也跳过
-        if is_fold_finished(fold_dir):
-            print(f'[INFO] Skip fold {fold} (already finished).')
-            continue
+            # 1) 小于 start_fold 的一律跳过
+            if fold < start_fold:
+                print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
+                continue
 
-        print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
+            # 2) 如果该 fold 已完整完成，也跳过
+            if is_fold_finished(fold_dir):
+                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                print(f'[INFO] Skip fold {fold} (already finished).')
+                continue
 
-        X_train, X_test = dataset[train_idx], dataset[test_idx]
-        y_train, y_test = labels[train_idx], labels[test_idx]
-
-        print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
-        print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
-
-        print_label_distribution(y_train, split_name=f'fold {fold} train')
-        print_label_distribution(y_test, split_name=f'fold {fold} test')
-
-        train_set = TensorDataset(X_train, y_train)
-        test_set = TensorDataset(X_test, y_test)
-
-        train_loader = build_dataloader(
-            dataset=train_set,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=8
-        )
-        test_loader = build_dataloader(
-            dataset=test_set,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=8
-        )
-
-        model = Transformer(config).to(config.device)
-        criterion = nn.CrossEntropyLoss()
-
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=0.01
-        )
-
-        early_stopping = EarlyStopping(
-            patience=12,
-            verbose=True,
-            save_all_checkpoint=save_all_checkpoint
-        )
-
-        train_ACC = []
-        train_LOSS = []
-        test_ACC = []
-        test_LOSS = []
-        val_ACC = []
-        val_LOSS = []
-
-        for epoch in range(config.num_epochs):
-            model.train()
-
-            total_train_loss = 0.0
-            total_train_correct = 0
-            total_train_samples = 0
-
-            loop = tqdm(train_loader, total=len(train_loader), desc=f'Fold {fold} Epoch {epoch}')
-
-            for data, target in loop:
-                data = data.to(config.device, non_blocking=True)
-                target = target.to(config.device, non_blocking=True).long()
-
-                optimizer.zero_grad()
-                output = model(data)
-                loss = criterion(output, target)
-                loss.backward()
-                optimizer.step()
-
-                pred = torch.argmax(output, dim=1)
-
-                batch_size = target.size(0)
-                total_train_loss += loss.item() * batch_size
-                total_train_correct += (pred == target).sum().item()
-                total_train_samples += batch_size
-
-                train_acc_batch = (pred == target).float().mean().item()
-
-                loop.set_postfix(
-                    loss=f'{loss.item():.4f}',
-                    train_acc=f'{train_acc_batch:.4f}'
+            metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
+            if os.path.exists(metadata_path):
+                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+            elif has_fold_outputs(fold_dir):
+                raise RuntimeError(
+                    f'[ERROR] Fold {fold} has existing outputs but no {SPLIT_METADATA_FILE}. '
+                    'Refusing to continue because the split for existing artifacts cannot be verified.'
                 )
 
-            train_loss = total_train_loss / total_train_samples
-            train_acc = total_train_correct / total_train_samples
+            any_fold_trained = True
 
-            need_print_dist = (epoch < 3) or (epoch % 10 == 0)
+            print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
 
-            test_acc, test_loss = evaluate(
-                model=model,
-                loader=test_loader,
-                criterion=criterion,
-                config=config,
-                split_name='test',
-                print_distribution=need_print_dist
-            )
-            val_acc, val_loss = evaluate(
-                model=model,
-                loader=val_loader,
-                criterion=criterion,
-                config=config,
-                split_name='val',
-                print_distribution=need_print_dist
-            )
+            X_train, X_test = dataset[train_idx], dataset[test_idx]
+            y_train, y_test = labels[train_idx], labels[test_idx]
+            save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
 
-            print(
-                f'Epoch: {epoch:3d} | '
-                f'train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | '
-                f'val acc: {val_acc:.4f} | val loss: {val_loss:.4f} | '
-                f'test acc: {test_acc:.4f} | test loss: {test_loss:.4f}'
-            )
+            print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
+            print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
 
-            train_ACC.append(train_acc)
-            train_LOSS.append(train_loss)
-            test_ACC.append(test_acc)
-            test_LOSS.append(test_loss)
-            val_ACC.append(val_acc)
-            val_LOSS.append(val_loss)
+            print_label_distribution(y_train, split_name=f'fold {fold} train')
+            print_label_distribution(y_test, split_name=f'fold {fold} test')
 
-            model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
-            early_stopping(val_acc, model, path=model_path)
+            with tracker.start_run(run_name=f'fold{fold}', nested=True) as _:
+                tracker.log_params({
+                    'fold_index': fold,
+                    'train_size': len(train_idx),
+                    'test_size': len(test_idx),
+                    'val_size': len(val_loader.dataset) if hasattr(val_loader, 'dataset') else None,
+                    'x_train_shape': tuple(X_train.shape),
+                    'y_train_shape': tuple(y_train.shape),
+                    'x_test_shape': tuple(X_test.shape),
+                    'y_test_shape': tuple(y_test.shape),
+                })
+                tracker.log_params({f'train_distribution_{k}': v for k, v in label_distribution(y_train).items()})
+                tracker.log_params({f'test_distribution_{k}': v for k, v in label_distribution(y_test).items()})
 
-            if early_stopping.early_stop:
-                print(f'[INFO] Early stopping at epoch {epoch}')
-                break
+                train_set = TensorDataset(X_train, y_train)
+                test_set = TensorDataset(X_test, y_test)
 
-        np.save(os.path.join(fold_dir, 'train_LOSS.npy'), np.array(train_LOSS))
-        np.save(os.path.join(fold_dir, 'train_ACC.npy'), np.array(train_ACC))
-        np.save(os.path.join(fold_dir, 'test_LOSS.npy'), np.array(test_LOSS))
-        np.save(os.path.join(fold_dir, 'test_ACC.npy'), np.array(test_ACC))
-        np.save(os.path.join(fold_dir, 'val_LOSS.npy'), np.array(val_LOSS))
-        np.save(os.path.join(fold_dir, 'val_ACC.npy'), np.array(val_ACC))
+                train_loader = build_dataloader(
+                    dataset=train_set,
+                    batch_size=config.batch_size,
+                    shuffle=True,
+                    num_workers=8
+                )
+                test_loader = build_dataloader(
+                    dataset=test_set,
+                    batch_size=config.batch_size,
+                    shuffle=False,
+                    num_workers=8
+                )
 
-        del model
-        torch.cuda.empty_cache()
+                model = Transformer(config).to(config.device)
+                criterion = nn.CrossEntropyLoss()
+
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=0.01
+                )
+
+                early_stopping = EarlyStopping(
+                    patience=12,
+                    verbose=True,
+                    save_all_checkpoint=save_all_checkpoint
+                )
+
+                train_ACC = []
+                train_LOSS = []
+                test_ACC = []
+                test_LOSS = []
+                val_ACC = []
+                val_LOSS = []
+                stopped_epoch = None
+                early_stopped = False
+
+                for epoch in range(config.num_epochs):
+                    model.train()
+
+                    total_train_loss = 0.0
+                    total_train_correct = 0
+                    total_train_samples = 0
+
+                    loop = tqdm(train_loader, total=len(train_loader), desc=f'Fold {fold} Epoch {epoch}')
+
+                    for data, target in loop:
+                        data = data.to(config.device, non_blocking=True)
+                        target = target.to(config.device, non_blocking=True).long()
+
+                        optimizer.zero_grad()
+                        output = model(data)
+                        loss = criterion(output, target)
+                        loss.backward()
+                        optimizer.step()
+
+                        pred = torch.argmax(output, dim=1)
+
+                        batch_size = target.size(0)
+                        total_train_loss += loss.item() * batch_size
+                        total_train_correct += (pred == target).sum().item()
+                        total_train_samples += batch_size
+
+                        train_acc_batch = (pred == target).float().mean().item()
+
+                        loop.set_postfix(
+                            loss=f'{loss.item():.4f}',
+                            train_acc=f'{train_acc_batch:.4f}'
+                        )
+
+                    train_loss = total_train_loss / total_train_samples
+                    train_acc = total_train_correct / total_train_samples
+
+                    need_print_dist = (epoch < 3) or (epoch % 10 == 0)
+
+                    test_acc, test_loss = evaluate(
+                        model=model,
+                        loader=test_loader,
+                        criterion=criterion,
+                        config=config,
+                        split_name='test',
+                        print_distribution=need_print_dist
+                    )
+                    val_acc, val_loss = evaluate(
+                        model=model,
+                        loader=val_loader,
+                        criterion=criterion,
+                        config=config,
+                        split_name='val',
+                        print_distribution=need_print_dist
+                    )
+
+                    print(
+                        f'Epoch: {epoch:3d} | '
+                        f'train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | '
+                        f'val acc: {val_acc:.4f} | val loss: {val_loss:.4f} | '
+                        f'test acc: {test_acc:.4f} | test loss: {test_loss:.4f}'
+                    )
+
+                    train_ACC.append(train_acc)
+                    train_LOSS.append(train_loss)
+                    test_ACC.append(test_acc)
+                    test_LOSS.append(test_loss)
+                    val_ACC.append(val_acc)
+                    val_LOSS.append(val_loss)
+
+                    model_path = os.path.join(fold_dir, f'model_{fold}_epoch{epoch}.pkl')
+                    early_stopping(val_acc, model, path=model_path)
+                    stopped_epoch = epoch
+
+                    tracker.log_metrics({
+                        'train_loss': train_loss,
+                        'train_acc': train_acc,
+                        'test_loss': test_loss,
+                        'test_acc': test_acc,
+                        'val_loss': val_loss,
+                        'val_acc': val_acc,
+                        'learning_rate': optimizer.param_groups[0]['lr'],
+                        'best_val_acc_so_far': early_stopping.best_metric,
+                        'early_stopping_counter': early_stopping.counter,
+                    }, step=epoch)
+
+                    if early_stopping.early_stop:
+                        early_stopped = True
+                        print(f'[INFO] Early stopping at epoch {epoch}')
+                        break
+
+                np.save(os.path.join(fold_dir, 'train_LOSS.npy'), np.array(train_LOSS))
+                np.save(os.path.join(fold_dir, 'train_ACC.npy'), np.array(train_ACC))
+                np.save(os.path.join(fold_dir, 'test_LOSS.npy'), np.array(test_LOSS))
+                np.save(os.path.join(fold_dir, 'test_ACC.npy'), np.array(test_ACC))
+                np.save(os.path.join(fold_dir, 'val_LOSS.npy'), np.array(val_LOSS))
+                np.save(os.path.join(fold_dir, 'val_ACC.npy'), np.array(val_ACC))
+
+                best_epoch = int(np.argmax(val_ACC)) if val_ACC else -1
+                best_val_acc = float(np.max(val_ACC)) if val_ACC else 0.0
+                tracker.log_metrics({
+                    'best_val_acc': best_val_acc,
+                    'best_epoch': best_epoch,
+                    'stopped_epoch': stopped_epoch if stopped_epoch is not None else -1,
+                    'early_stopped': int(early_stopped),
+                    'final_train_loss': train_LOSS[-1] if train_LOSS else 0.0,
+                    'final_train_acc': train_ACC[-1] if train_ACC else 0.0,
+                    'final_val_loss': val_LOSS[-1] if val_LOSS else 0.0,
+                    'final_val_acc': val_ACC[-1] if val_ACC else 0.0,
+                    'final_test_loss': test_LOSS[-1] if test_LOSS else 0.0,
+                    'final_test_acc': test_ACC[-1] if test_ACC else 0.0,
+                })
+                log_fold_artifacts(tracker, fold_dir)
+
+                del model
+                torch.cuda.empty_cache()
+
+        if not any_fold_trained:
+            print('[INFO] All discovered folds are already finished. Nothing to do.')
 
 
 if __name__ == '__main__':
