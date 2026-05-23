@@ -9,16 +9,21 @@ load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=False)
 import torch
 
 
+def _get_int_env(name, default):
+    value = os.getenv(name, '').strip()
+    return int(value) if value else default
+
+
 class Config(object):
     """args in model and trainer"""
     def __init__(self):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
         # basic training settings
-        self.num_fold = 10
+        self.num_fold = _get_int_env('MCSN_NUM_FOLD', 10)
         self.num_classes = 5
-        self.num_epochs = 45
-        self.batch_size = 512
+        self.num_epochs = _get_int_env('MCSN_NUM_EPOCHS', 45)
+        self.batch_size = _get_int_env('MCSN_BATCH_SIZE', 512)
         self.pad_size = 29
         self.learning_rate = 5e-5
 
@@ -69,7 +74,7 @@ class Config(object):
 class Path(object):
     """path of files in this project"""
     def __init__(self):
-        old_root = '/openbayes/home/MultiChannelSleepNet'
+        old_root = os.getenv('MCSN_DATA_ROOT', '').strip() or '/openbayes/home/MultiChannelSleepNet'
 
         self.path_PSG = os.path.join(old_root, 'dataset/sleepEDF-78/sleep-cassette')
         self.path_hypnogram = os.path.join(old_root, 'dataset/sleepEDF-78/Hypnogram')

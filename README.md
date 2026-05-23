@@ -26,7 +26,14 @@ python train.py
 python evaluate.py
 ```
 
-Adjust dataset and output paths in `config.py` before running the pipeline.
+Copy `.env.example` to `.env` for local overrides. These values can be configured without editing `config.py`:
+
+```dotenv
+MCSN_NUM_FOLD=10
+MCSN_NUM_EPOCHS=45
+MCSN_DATA_ROOT=/openbayes/home/MultiChannelSleepNet
+MCSN_BATCH_SIZE=512
+```
 
 ## File Naming
 
