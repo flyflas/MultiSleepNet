@@ -69,6 +69,9 @@ def log_config_params(tracker, config):
         'fc_hidden': config.fc_hidden,
         'num_head': config.num_head,
         'num_encoder': config.num_encoder,
+        'sse_window_size': config.sse_window_size,
+        'sse_num_windows': config.sse_num_windows,
+        'sse_num_encoder': config.sse_num_encoder,
         'num_encoder_multi': config.num_encoder_multi,
         'use_positional_encoding': config.use_positional_encoding,
         'mamba_d_state': config.mamba_d_state,
@@ -89,7 +92,7 @@ def log_fold_artifacts(tracker, fold_dir):
             tracker.log_artifact(os.path.join(fold_dir, filename), artifact_path=os.path.basename(fold_dir))
 
 
-def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels):
+def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, tf_dataset, sse_dataset, labels):
     np.savez(
         os.path.join(fold_dir, SPLIT_METADATA_FILE),
         fold_index=np.array(fold, dtype=np.int64),
@@ -99,14 +102,16 @@ def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, la
         shuffle=np.array(SPLIT_SHUFFLE, dtype=np.bool_),
         train_idx=np.asarray(train_idx, dtype=np.int64),
         test_idx=np.asarray(test_idx, dtype=np.int64),
-        dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
+        tf_dataset_shape=np.asarray(tf_dataset.shape, dtype=np.int64),
+        sse_dataset_shape=np.asarray(sse_dataset.shape, dtype=np.int64),
         labels_shape=np.asarray(labels.shape, dtype=np.int64),
-        train_test_dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
+        train_test_tf_dataset_shape=np.asarray(tf_dataset.shape, dtype=np.int64),
+        train_test_sse_dataset_shape=np.asarray(sse_dataset.shape, dtype=np.int64),
         train_test_labels_shape=np.asarray(labels.shape, dtype=np.int64),
     )
 
 
-def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels):
+def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, tf_dataset, sse_dataset, labels):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
         raise RuntimeError(
@@ -123,9 +128,11 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
         'shuffle',
         'train_idx',
         'test_idx',
-        'dataset_shape',
+        'tf_dataset_shape',
+        'sse_dataset_shape',
         'labels_shape',
-        'train_test_dataset_shape',
+        'train_test_tf_dataset_shape',
+        'train_test_sse_dataset_shape',
         'train_test_labels_shape',
     }
     missing_keys = sorted(required_keys - set(metadata.files))
@@ -143,11 +150,16 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
         'shuffle': bool(metadata['shuffle']) == SPLIT_SHUFFLE,
         'train_idx': np.array_equal(metadata['train_idx'], np.asarray(train_idx, dtype=np.int64)),
         'test_idx': np.array_equal(metadata['test_idx'], np.asarray(test_idx, dtype=np.int64)),
-        'dataset_shape': np.array_equal(metadata['dataset_shape'], np.asarray(dataset.shape, dtype=np.int64)),
+        'tf_dataset_shape': np.array_equal(metadata['tf_dataset_shape'], np.asarray(tf_dataset.shape, dtype=np.int64)),
+        'sse_dataset_shape': np.array_equal(metadata['sse_dataset_shape'], np.asarray(sse_dataset.shape, dtype=np.int64)),
         'labels_shape': np.array_equal(metadata['labels_shape'], np.asarray(labels.shape, dtype=np.int64)),
-        'train_test_dataset_shape': np.array_equal(
-            metadata['train_test_dataset_shape'],
-            np.asarray(dataset.shape, dtype=np.int64)
+        'train_test_tf_dataset_shape': np.array_equal(
+            metadata['train_test_tf_dataset_shape'],
+            np.asarray(tf_dataset.shape, dtype=np.int64)
+        ),
+        'train_test_sse_dataset_shape': np.array_equal(
+            metadata['train_test_sse_dataset_shape'],
+            np.asarray(sse_dataset.shape, dtype=np.int64)
         ),
         'train_test_labels_shape': np.array_equal(
             metadata['train_test_labels_shape'],
@@ -183,11 +195,12 @@ def evaluate(model, loader, criterion, config, split_name='eval', print_distribu
     total_samples = 0
 
     with torch.no_grad():
-        for data, target in loader:
-            data = data.to(config.device, non_blocking=True)
+        for tf_data, sse_data, target in loader:
+            tf_data = tf_data.to(config.device, non_blocking=True)
+            sse_data = sse_data.to(config.device, non_blocking=True)
             target = target.to(config.device, non_blocking=True).long()
 
-            output = model(data)
+            output = model(tf_data, sse_data)
             loss = criterion(output, target)
 
             batch_size = target.size(0)
@@ -271,12 +284,13 @@ def train(save_all_checkpoint=False, start_fold=None):
     if config.max_folds_to_run is not None:
         print(f'[INFO] max_folds_to_run = {config.max_folds_to_run} (limits newly trained folds only)')
 
-    dataset, labels, val_loader = data_generator(
+    tf_dataset, sse_dataset, labels, val_loader = data_generator(
         path_labels=path.path_labels,
         path_dataset=path.path_TF
     )
 
-    print(f'[INFO] dataset shape: {dataset.shape}')
+    print(f'[INFO] tf dataset shape: {tf_dataset.shape}')
+    print(f'[INFO] sse dataset shape: {sse_dataset.shape}')
     print(f'[INFO] labels shape: {labels.shape}')
     print_label_distribution(labels, split_name='full dataset')
 
@@ -297,10 +311,12 @@ def train(save_all_checkpoint=False, start_fold=None):
     with tracker.start_run(run_name=config.mlflow_run_name or 'train') as _:
         log_config_params(tracker, config)
         tracker.log_params({
-            'dataset_shape': tuple(dataset.shape),
+            'tf_dataset_shape': tuple(tf_dataset.shape),
+            'sse_dataset_shape': tuple(sse_dataset.shape),
             'labels_shape': tuple(labels.shape),
             'dataset_size': len(labels),
-            'train_test_dataset_shape': tuple(dataset.shape),
+            'train_test_tf_dataset_shape': tuple(tf_dataset.shape),
+            'train_test_sse_dataset_shape': tuple(sse_dataset.shape),
             'train_test_labels_shape': tuple(labels.shape),
             'val_ratio': config.val_ratio,
             'max_folds_to_run': config.max_folds_to_run,
@@ -312,26 +328,35 @@ def train(save_all_checkpoint=False, start_fold=None):
         any_fold_trained = False
         newly_trained_folds = 0
 
-        for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
+        for fold, (train_idx, test_idx) in enumerate(kf.split(tf_dataset, labels)):
             fold_dir = f'./Kfold_models/fold{fold}'
             os.makedirs(fold_dir, exist_ok=True)
 
             # 1) 小于 start_fold 的一律跳过
             if fold < start_fold:
                 if is_fold_finished(fold_dir):
-                    validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                    validate_existing_split_metadata(
+                        fold_dir,
+                        fold,
+                        config,
+                        train_idx,
+                        test_idx,
+                        tf_dataset,
+                        sse_dataset,
+                        labels
+                    )
                 print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
                 continue
 
             # 2) 如果该 fold 已完整完成，也跳过
             if is_fold_finished(fold_dir):
-                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, tf_dataset, sse_dataset, labels)
                 print(f'[INFO] Skip fold {fold} (already finished).')
                 continue
 
             metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
             if os.path.exists(metadata_path):
-                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, tf_dataset, sse_dataset, labels)
             elif has_fold_outputs(fold_dir):
                 raise RuntimeError(
                     f'[ERROR] Fold {fold} has existing outputs but no {SPLIT_METADATA_FILE}. '
@@ -352,12 +377,13 @@ def train(save_all_checkpoint=False, start_fold=None):
 
             print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
 
-            X_train, X_test = dataset[train_idx], dataset[test_idx]
+            tf_train, tf_test = tf_dataset[train_idx], tf_dataset[test_idx]
+            sse_train, sse_test = sse_dataset[train_idx], sse_dataset[test_idx]
             y_train, y_test = labels[train_idx], labels[test_idx]
-            save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+            save_split_metadata(fold_dir, fold, config, train_idx, test_idx, tf_dataset, sse_dataset, labels)
 
-            print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
-            print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
+            print(f'[INFO][fold {fold}] tf_train shape = {tf_train.shape}, sse_train shape = {sse_train.shape}, y_train shape = {y_train.shape}')
+            print(f'[INFO][fold {fold}] tf_test  shape = {tf_test.shape}, sse_test  shape = {sse_test.shape}, y_test  shape = {y_test.shape}')
 
             print_label_distribution(y_train, split_name=f'fold {fold} train')
             print_label_distribution(y_test, split_name=f'fold {fold} test')
@@ -368,16 +394,18 @@ def train(save_all_checkpoint=False, start_fold=None):
                     'train_size': len(train_idx),
                     'test_size': len(test_idx),
                     'val_size': len(val_loader.dataset) if hasattr(val_loader, 'dataset') else None,
-                    'x_train_shape': tuple(X_train.shape),
+                    'tf_train_shape': tuple(tf_train.shape),
+                    'sse_train_shape': tuple(sse_train.shape),
                     'y_train_shape': tuple(y_train.shape),
-                    'x_test_shape': tuple(X_test.shape),
+                    'tf_test_shape': tuple(tf_test.shape),
+                    'sse_test_shape': tuple(sse_test.shape),
                     'y_test_shape': tuple(y_test.shape),
                 })
                 tracker.log_params({f'train_distribution_{k}': v for k, v in label_distribution(y_train).items()})
                 tracker.log_params({f'test_distribution_{k}': v for k, v in label_distribution(y_test).items()})
 
-                train_set = TensorDataset(X_train, y_train)
-                test_set = TensorDataset(X_test, y_test)
+                train_set = TensorDataset(tf_train, sse_train, y_train)
+                test_set = TensorDataset(tf_test, sse_test, y_test)
 
                 train_loader = build_dataloader(
                     dataset=train_set,
@@ -425,12 +453,13 @@ def train(save_all_checkpoint=False, start_fold=None):
 
                     loop = tqdm(train_loader, total=len(train_loader), desc=f'Fold {fold} Epoch {epoch}')
 
-                    for data, target in loop:
-                        data = data.to(config.device, non_blocking=True)
+                    for tf_data, sse_data, target in loop:
+                        tf_data = tf_data.to(config.device, non_blocking=True)
+                        sse_data = sse_data.to(config.device, non_blocking=True)
                         target = target.to(config.device, non_blocking=True).long()
 
                         optimizer.zero_grad()
-                        output = model(data)
+                        output = model(tf_data, sse_data)
                         loss = criterion(output, target)
                         loss.backward()
                         optimizer.step()

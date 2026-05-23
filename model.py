@@ -52,12 +52,48 @@ class CrossAttentionBlock(nn.Module):
         return x
 
 
+class ConcatLinearFusion(nn.Module):
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.tf_norm = nn.LayerNorm(d_model)
+        self.sse_norm = nn.LayerNorm(d_model)
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, tf_x, sse_x):
+        x = torch.cat([self.tf_norm(tf_x), self.sse_norm(sse_x)], dim=2)
+        return self.fusion(x)
+
+
 class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()
 
         self.position_single = PositionalEncoding(config.dim_model, 0.1, config.pad_size + 1)
+        self.position_sse = PositionalEncoding(config.dim_model, 0.1, config.sse_num_windows + 1)
         self.position_multi = PositionalEncoding(config.dim_model * 3, 0.1, config.pad_size + 1)
+
+        self.sse_tokenizer_1 = nn.Sequential(
+            nn.LayerNorm(config.sse_window_size),
+            nn.Linear(config.sse_window_size, config.dim_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout)
+        )
+        self.sse_tokenizer_2 = nn.Sequential(
+            nn.LayerNorm(config.sse_window_size),
+            nn.Linear(config.sse_window_size, config.dim_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout)
+        )
+        self.sse_tokenizer_3 = nn.Sequential(
+            nn.LayerNorm(config.sse_window_size),
+            nn.Linear(config.sse_window_size, config.dim_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout)
+        )
 
         encoder_layer_1 = nn.TransformerEncoderLayer(
             d_model=config.dim_model,
@@ -81,9 +117,39 @@ class Transformer(nn.Module):
             batch_first=True
         )
 
+        sse_encoder_layer_1 = nn.TransformerEncoderLayer(
+            d_model=config.dim_model,
+            nhead=config.num_head,
+            dim_feedforward=config.forward_hidden,
+            dropout=config.dropout,
+            batch_first=True
+        )
+        sse_encoder_layer_2 = nn.TransformerEncoderLayer(
+            d_model=config.dim_model,
+            nhead=config.num_head,
+            dim_feedforward=config.forward_hidden,
+            dropout=config.dropout,
+            batch_first=True
+        )
+        sse_encoder_layer_3 = nn.TransformerEncoderLayer(
+            d_model=config.dim_model,
+            nhead=config.num_head,
+            dim_feedforward=config.forward_hidden,
+            dropout=config.dropout,
+            batch_first=True
+        )
+
         self.transformer_encoder_1 = nn.TransformerEncoder(encoder_layer_1, num_layers=config.num_encoder)
         self.transformer_encoder_2 = nn.TransformerEncoder(encoder_layer_2, num_layers=config.num_encoder)
         self.transformer_encoder_3 = nn.TransformerEncoder(encoder_layer_3, num_layers=config.num_encoder)
+
+        self.sse_encoder_1 = nn.TransformerEncoder(sse_encoder_layer_1, num_layers=config.sse_num_encoder)
+        self.sse_encoder_2 = nn.TransformerEncoder(sse_encoder_layer_2, num_layers=config.sse_num_encoder)
+        self.sse_encoder_3 = nn.TransformerEncoder(sse_encoder_layer_3, num_layers=config.sse_num_encoder)
+
+        self.fusion_1 = ConcatLinearFusion(config.dim_model, config.dropout)
+        self.fusion_2 = ConcatLinearFusion(config.dim_model, config.dropout)
+        self.fusion_3 = ConcatLinearFusion(config.dim_model, config.dropout)
 
         self.cross_eeg1_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
         self.cross_eeg2_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
@@ -111,10 +177,14 @@ class Transformer(nn.Module):
         )
         self.fc2 = nn.Linear(config.fc_hidden, config.num_classes)
 
-    def forward(self, x):
-        x1 = x[:, 0]
-        x2 = x[:, 1]
-        x3 = x[:, 2]
+    def forward(self, tf_x, sse_x):
+        x1 = tf_x[:, 0]
+        x2 = tf_x[:, 1]
+        x3 = tf_x[:, 2]
+
+        sse1 = sse_x[:, 0]
+        sse2 = sse_x[:, 1]
+        sse3 = sse_x[:, 2]
 
         x1 = self.position_single(x1)
         x2 = self.position_single(x2)
@@ -123,6 +193,22 @@ class Transformer(nn.Module):
         x1 = self.transformer_encoder_1(x1)
         x2 = self.transformer_encoder_2(x2)
         x3 = self.transformer_encoder_3(x3)
+
+        sse1 = self.sse_tokenizer_1(sse1)
+        sse2 = self.sse_tokenizer_2(sse2)
+        sse3 = self.sse_tokenizer_3(sse3)
+
+        sse1 = self.position_sse(sse1)
+        sse2 = self.position_sse(sse2)
+        sse3 = self.position_sse(sse3)
+
+        sse1 = self.sse_encoder_1(sse1)
+        sse2 = self.sse_encoder_2(sse2)
+        sse3 = self.sse_encoder_3(sse3)
+
+        x1 = self.fusion_1(x1, sse1)
+        x2 = self.fusion_2(x2, sse2)
+        x3 = self.fusion_3(x3, sse3)
 
         x1_eog = self.cross_eeg1_eog(x1, x3, x3)
         x2_eog = self.cross_eeg2_eog(x2, x3, x3)

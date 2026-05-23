@@ -129,7 +129,7 @@ def find_trained_fold_dirs(root='./Kfold_models'):
     return sorted(fold_dirs, key=lambda item: item[0])
 
 
-def load_split_metadata(fold, fold_dir, config, dataset, labels):
+def load_split_metadata(fold, fold_dir, config, tf_dataset, sse_dataset, labels):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
         raise RuntimeError(
@@ -146,7 +146,8 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
         'shuffle',
         'train_idx',
         'test_idx',
-        'dataset_shape',
+        'tf_dataset_shape',
+        'sse_dataset_shape',
         'labels_shape',
         'train_test_dataset_shape',
         'train_test_labels_shape',
@@ -158,9 +159,11 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
     metadata_fold = int(metadata['fold_index'])
     metadata_num_fold = int(metadata['num_fold'])
     metadata_val_ratio = float(metadata['val_ratio'])
-    metadata_dataset_shape = tuple(int(v) for v in metadata['dataset_shape'])
+    metadata_tf_dataset_shape = tuple(int(v) for v in metadata['tf_dataset_shape'])
+    metadata_sse_dataset_shape = tuple(int(v) for v in metadata['sse_dataset_shape'])
     metadata_labels_shape = tuple(int(v) for v in metadata['labels_shape'])
-    metadata_train_test_dataset_shape = tuple(int(v) for v in metadata['train_test_dataset_shape'])
+    metadata_train_test_tf_dataset_shape = tuple(int(v) for v in metadata['train_test_tf_dataset_shape'])
+    metadata_train_test_sse_dataset_shape = tuple(int(v) for v in metadata['train_test_sse_dataset_shape'])
     metadata_train_test_labels_shape = tuple(int(v) for v in metadata['train_test_labels_shape'])
     train_idx = np.asarray(metadata['train_idx'], dtype=np.int64)
     test_idx = np.asarray(metadata['test_idx'], dtype=np.int64)
@@ -181,18 +184,27 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
             f'[ERROR] fold {fold} was trained with val_ratio={metadata_val_ratio}, '
             f'but current config.val_ratio={config.val_ratio}. Refusing to evaluate mixed split definitions.'
         )
-    if metadata_dataset_shape != tuple(dataset.shape):
+    if metadata_tf_dataset_shape != tuple(tf_dataset.shape):
         raise RuntimeError(
-            f'[ERROR] fold {fold} dataset shape mismatch: trained={metadata_dataset_shape}, current={tuple(dataset.shape)}.'
+            f'[ERROR] fold {fold} TF dataset shape mismatch: trained={metadata_tf_dataset_shape}, current={tuple(tf_dataset.shape)}.'
+        )
+    if metadata_sse_dataset_shape != tuple(sse_dataset.shape):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} SSE dataset shape mismatch: trained={metadata_sse_dataset_shape}, current={tuple(sse_dataset.shape)}.'
         )
     if metadata_labels_shape != tuple(labels.shape):
         raise RuntimeError(
             f'[ERROR] fold {fold} labels shape mismatch: trained={metadata_labels_shape}, current={tuple(labels.shape)}.'
         )
-    if metadata_train_test_dataset_shape != tuple(dataset.shape):
+    if metadata_train_test_tf_dataset_shape != tuple(tf_dataset.shape):
         raise RuntimeError(
-            f'[ERROR] fold {fold} train_test dataset shape mismatch: '
-            f'trained={metadata_train_test_dataset_shape}, current={tuple(dataset.shape)}.'
+            f'[ERROR] fold {fold} train_test TF dataset shape mismatch: '
+            f'trained={metadata_train_test_tf_dataset_shape}, current={tuple(tf_dataset.shape)}.'
+        )
+    if metadata_train_test_sse_dataset_shape != tuple(sse_dataset.shape):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} train_test SSE dataset shape mismatch: '
+            f'trained={metadata_train_test_sse_dataset_shape}, current={tuple(sse_dataset.shape)}.'
         )
     if metadata_train_test_labels_shape != tuple(labels.shape):
         raise RuntimeError(
@@ -216,11 +228,12 @@ def test(model, test_loader, config):
     label = []
 
     with torch.no_grad():
-        for data, target in tqdm(test_loader, desc='Testing', leave=False):
-            data = data.to(config.device, non_blocking=True)
+        for tf_data, sse_data, target in tqdm(test_loader, desc='Testing', leave=False):
+            tf_data = tf_data.to(config.device, non_blocking=True)
+            sse_data = sse_data.to(config.device, non_blocking=True)
             target = target.to(config.device, non_blocking=True)
 
-            output = model(data)
+            output = model(tf_data, sse_data)
             pred.extend(torch.argmax(output, dim=1).cpu().numpy())
             label.extend(target.cpu().numpy())
 
@@ -255,15 +268,16 @@ def test(model, test_loader, config):
     )
 
 
-def evaluate_single_fold(config, dataset, labels, fold, test_idx):
+def evaluate_single_fold(config, tf_dataset, sse_dataset, labels, fold, test_idx):
     path_model = f'./Kfold_models/fold{fold}/model.pkl'
     if not os.path.exists(path_model):
         raise FileNotFoundError(f'Model not found: {path_model}')
 
-    X_test = dataset[test_idx]
+    tf_test = tf_dataset[test_idx]
+    sse_test = sse_dataset[test_idx]
     y_test = labels[test_idx]
 
-    test_set = TensorDataset(X_test, y_test)
+    test_set = TensorDataset(tf_test, sse_test, y_test)
     test_loader = DataLoader(
         dataset=test_set,
         batch_size=config.batch_size,
@@ -286,7 +300,7 @@ def evaluate(config, path, tracker=None):
     if tracker is None:
         tracker = MLflowTracker(config)
 
-    dataset, labels, _ = data_generator(
+    tf_dataset, sse_dataset, labels, _ = data_generator(
         path_labels=path.path_labels,
         path_dataset=path.path_TF
     )
@@ -297,9 +311,11 @@ def evaluate(config, path, tracker=None):
             'val_ratio': config.val_ratio,
             'num_classes': config.num_classes,
             'batch_size': config.batch_size,
-            'dataset_shape': tuple(dataset.shape),
+            'tf_dataset_shape': tuple(tf_dataset.shape),
+            'sse_dataset_shape': tuple(sse_dataset.shape),
             'labels_shape': tuple(labels.shape),
-            'train_test_dataset_shape': tuple(dataset.shape),
+            'train_test_tf_dataset_shape': tuple(tf_dataset.shape),
+            'train_test_sse_dataset_shape': tuple(sse_dataset.shape),
             'train_test_labels_shape': tuple(labels.shape),
             'dataset_size': len(labels),
             'device': config.device,
@@ -321,7 +337,7 @@ def evaluate(config, path, tracker=None):
             raise RuntimeError('[ERROR] No trained fold models found.')
 
         for fold, fold_dir in trained_folds:
-            test_idx = load_split_metadata(fold, fold_dir, config, dataset, labels)
+            test_idx = load_split_metadata(fold, fold_dir, config, tf_dataset, sse_dataset, labels)
 
             print('\n' + '-' * 15, '>', f'Fold {fold}', '<', '-' * 15)
 
@@ -335,7 +351,7 @@ def evaluate(config, path, tracker=None):
                 balanced_acc,
                 con_mat,
                 class_wise_fold
-            ) = evaluate_single_fold(config, dataset, labels, fold, test_idx)
+            ) = evaluate_single_fold(config, tf_dataset, sse_dataset, labels, fold, test_idx)
 
             tracker.log_metrics({
                 f'fold_{fold}_acc': accuracy,

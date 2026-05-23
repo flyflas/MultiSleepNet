@@ -57,6 +57,8 @@ class Config(object):
         self.num_epochs = _get_int_env('MCSN_NUM_EPOCHS', 45)
         self.batch_size = _get_int_env('MCSN_BATCH_SIZE', 512)
         self.pad_size = 29
+        self.sse_window_size = 200
+        self.sse_num_windows = 29
         self.learning_rate = 5e-5
 
         # model settings
@@ -66,6 +68,7 @@ class Config(object):
         self.fc_hidden = 1024
         self.num_head = 8
         self.num_encoder = 16
+        self.sse_num_encoder = 1
         self.num_encoder_multi = 4
 
         # mamba settings
