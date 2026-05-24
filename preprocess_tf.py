@@ -14,6 +14,10 @@ CHANNELS = ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']
 METADATA_FILE_NAME = 'tf_per_file_metadata.csv'
 PER_FILE_DIR_NAME = 'per_file'
 SLEEP_EDF_SUBJECT_RE = re.compile(r'^[A-Za-z]{2}\d{4}')
+NORMALIZATION_STRATEGY = (
+    'channel-level global mean/std computed across all files, '
+    'then applied unchanged to every per-file TF array'
+)
 
 
 def get_npy_file_list(path_array):
@@ -180,43 +184,112 @@ def spectrogram(x, window, n_overlap, nfft):
     return spectrogram_data
 
 
-def data_normalize(dataset, channel, save_dir):
-    """Normalize datasets of each channel to zero mean and unit variance."""
-    print(f'[INFO] Checking inf values before normalization for channel={channel} ...')
-    for i in tqdm(range(dataset.shape[0])):
-        if np.any(np.isinf(dataset[i])):
-            for j in range(29):
-                if np.any(np.isinf(dataset[i][j])):
-                    for k in range(128):
-                        if np.isinf(dataset[i][j][k]):
-                            print('location of inf: ', i, ',', j, ',', k)
-                            if k == 0:
-                                if j == 0:
-                                    dataset[i][j][k] = dataset[i][j + 1][k]
-                                else:
-                                    dataset[i][j][k] = dataset[i][j - 1][k]
-                            else:
-                                dataset[i][j][k] = dataset[i][j][k - 1]
+def ensure_finite_tf_values(dataset, channel, stage):
+    """Replace non-finite TF values before stats so outputs never contain inf/nan."""
+    non_finite_mask = ~np.isfinite(dataset)
+    non_finite_count = int(np.count_nonzero(non_finite_mask))
+    if non_finite_count == 0:
+        return dataset
 
-    mean_val = np.mean(dataset)
-    std_val = np.std(dataset)
+    finite_values = dataset[~non_finite_mask]
+    if finite_values.size == 0:
+        raise ValueError(f'[ERROR] {channel} has no finite TF values during {stage}.')
 
-    print(f'[INFO] Before normalization: mean={mean_val:.6f}, std={std_val:.6f}')
-    dataset = (dataset - mean_val) / std_val
+    replacement = float(np.mean(finite_values, dtype=np.float64))
+    dataset = dataset.copy()
+    dataset[non_finite_mask] = replacement
+    print(
+        f'[WARN] Replaced {non_finite_count} non-finite TF values for channel={channel} '
+        f'during {stage} with finite channel mean={replacement:.6f}.'
+    )
+    return dataset
 
-    has_inf = np.any(np.isinf(dataset))
-    has_nan = np.any(np.isnan(dataset))
+
+def save_channel_global_stats(dataset, channel, save_dir):
+    """Compute and save global channel-level normalization stats."""
+    mean_val = float(np.mean(dataset, dtype=np.float64))
+    std_val = float(np.std(dataset, dtype=np.float64))
+
+    if (not np.isfinite(mean_val)) or (not np.isfinite(std_val)) or std_val <= 0.0:
+        raise ValueError(
+            f'[ERROR] Invalid normalization stats for {channel}: '
+            f'mean={mean_val}, std={std_val}'
+        )
+
+    stats = np.array([mean_val, std_val], dtype=np.float64)
+    stats_path = os.path.join(save_dir, f'TF_{channel}_mean_std_stats.npy')
+    np.save(stats_path, stats)
+
+    print(f'[INFO] Normalization strategy for {channel}: {NORMALIZATION_STRATEGY}.')
+    print(f'[INFO] Stats source for {channel}: computed from concatenated TF features in this run.')
+    print(f'[INFO] Saved channel global stats: {stats_path}')
+    print(f'[INFO] Stats values for {channel}: mean={mean_val:.6f}, std={std_val:.6f}')
+    return mean_val, std_val, stats_path
+
+
+def normalize_with_channel_global_stats(dataset, channel, mean_val, std_val, stats_path, save_dir):
+    """Normalize one channel using precomputed global stats and save legacy output."""
+    print(f'[INFO] Applying stats source for {channel}: {stats_path}')
+    normalized = apply_channel_global_stats(
+        dataset=dataset,
+        channel=channel,
+        mean_val=mean_val,
+        std_val=std_val,
+        stats_path=stats_path,
+        stage='legacy global normalized TF array'
+    )
 
     save_path = os.path.join(save_dir, f'TF_{channel}_mean_std.npy')
-    if (not has_inf) and (not has_nan):
-        np.save(save_path, dataset)
-        print(f'[INFO] Saved {save_path}, shape={dataset.shape}')
-        print(f'[INFO] After normalization: mean={np.mean(dataset):.6f}, std={np.std(dataset):.6f}')
-    else:
-        print(f'[ERROR] {channel} still contains inf or nan, not saved.')
-        raise ValueError(f'[ERROR] {channel} still contains inf or nan after normalization.')
+    np.save(save_path, normalized)
+    print(f'[INFO] Saved legacy global normalized TF array: {save_path}, shape={normalized.shape}')
+    print(f'[INFO] After normalization: mean={np.mean(normalized):.6f}, std={np.std(normalized):.6f}')
+    return normalized
 
-    return dataset
+
+def apply_channel_global_stats(dataset, channel, mean_val, std_val, stats_path, stage):
+    """Apply one channel-level global mean/std to a TF array."""
+    normalized = (
+        (dataset.astype(np.float32, copy=False) - np.float32(mean_val)) / np.float32(std_val)
+    ).astype(np.float32, copy=False)
+    normalized = ensure_finite_tf_values(
+        normalized,
+        channel=channel,
+        stage=f'after channel-level global normalization for {stage}'
+    )
+
+    if not np.all(np.isfinite(normalized)):
+        raise ValueError(
+            f'[ERROR] {channel} contains inf or nan after applying stats source {stats_path} '
+            f'for {stage}.'
+        )
+    return normalized
+
+
+def data_normalize(dataset, channel, save_dir, return_stats=False):
+    """Normalize a channel with one global mean/std shared by all files."""
+    print(f'[INFO] Normalization strategy: {NORMALIZATION_STRATEGY}.')
+    print('[INFO] This path does not perform per-file normalization.')
+    dataset = ensure_finite_tf_values(
+        dataset=dataset,
+        channel=channel,
+        stage='before channel-level global stats'
+    )
+    mean_val, std_val, stats_path = save_channel_global_stats(
+        dataset=dataset,
+        channel=channel,
+        save_dir=save_dir
+    )
+    normalized = normalize_with_channel_global_stats(
+        dataset=dataset,
+        channel=channel,
+        mean_val=mean_val,
+        std_val=std_val,
+        stats_path=stats_path,
+        save_dir=save_dir
+    )
+    if return_stats:
+        return normalized, mean_val, std_val, stats_path, dataset
+    return normalized
 
 
 def transform_to_tf(data_channel, fs, overlap, nfft, win_size):
@@ -232,8 +305,8 @@ def transform_to_tf(data_channel, fs, overlap, nfft, win_size):
     return X
 
 
-def save_per_file_tf(dataset, channel, sample_ids, epoch_counts, save_dir):
-    """Save normalized per-file TF arrays and return metadata paths."""
+def save_per_file_tf(dataset, channel, sample_ids, epoch_counts, save_dir, mean_val, std_val, stats_path):
+    """Save globally normalized per-file TF arrays and return metadata paths."""
     output_dir = os.path.join(save_dir, PER_FILE_DIR_NAME, channel)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -243,15 +316,28 @@ def save_per_file_tf(dataset, channel, sample_ids, epoch_counts, save_dir):
             f'does not match dataset size ({dataset.shape[0]})'
         )
 
+    print(f'[INFO] Per-file TF arrays for {channel} will use stats source: {stats_path}')
     paths = {}
     offset = 0
     for sample_id, num_epochs in zip(sample_ids, epoch_counts):
         end = offset + num_epochs
-        sample_tf = dataset[offset:end]
+        sample_tf = apply_channel_global_stats(
+            dataset=dataset[offset:end],
+            channel=channel,
+            mean_val=mean_val,
+            std_val=std_val,
+            stats_path=stats_path,
+            stage=f'per-file TF array sample_id={sample_id}'
+        )
         if sample_tf.shape != (num_epochs, 29, 128):
             raise ValueError(
                 f'[ERROR] {sample_id} {channel} TF shape mismatch: '
                 f'expected ({num_epochs}, 29, 128), got {sample_tf.shape}'
+            )
+        if not np.all(np.isfinite(sample_tf)):
+            raise ValueError(
+                f'[ERROR] {sample_id} {channel} contains inf or nan after '
+                'channel-level global normalization.'
             )
 
         save_path = os.path.join(output_dir, f'{sample_id}_TF_{channel}_mean_std.npy')
@@ -362,13 +448,21 @@ if __name__ == '__main__':
         X = transform_to_tf(data_channel, fs=fs, overlap=overlap, nfft=nfft, win_size=win_size)
         print(f'[INFO] TF image shape for {channel}: {X.shape}')
         print('Normalize:')
-        X = data_normalize(dataset=X, channel=channel, save_dir=path.path_TF)
-        channel_paths[channel] = save_per_file_tf(
+        _, mean_val, std_val, stats_path, finite_X = data_normalize(
             dataset=X,
+            channel=channel,
+            save_dir=path.path_TF,
+            return_stats=True
+        )
+        channel_paths[channel] = save_per_file_tf(
+            dataset=finite_X,
             channel=channel,
             sample_ids=sample_ids,
             epoch_counts=epoch_counts,
-            save_dir=path.path_TF
+            save_dir=path.path_TF,
+            mean_val=mean_val,
+            std_val=std_val,
+            stats_path=stats_path
         )
 
     label_paths = save_per_file_labels(
