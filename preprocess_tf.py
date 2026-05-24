@@ -1,4 +1,6 @@
 import os
+import csv
+import re
 import numpy as np
 
 from scipy.fftpack import fft
@@ -6,6 +8,12 @@ from scipy import signal
 from tqdm import tqdm
 
 from config import Path
+
+
+CHANNELS = ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']
+METADATA_FILE_NAME = 'tf_per_file_metadata.csv'
+PER_FILE_DIR_NAME = 'per_file'
+SLEEP_EDF_SUBJECT_RE = re.compile(r'^[A-Za-z]{2}\d{4}')
 
 
 def get_npy_file_list(path_array):
@@ -111,6 +119,46 @@ def data_array_concat(path_array):
     return data_channel
 
 
+def load_channel_data_with_boundaries(path_array, channel):
+    """Load one raw channel and keep file boundaries for per-file TF output."""
+    file_list = get_npy_file_list(path_array)
+    sample_ids = []
+    epoch_counts = []
+    data_list = []
+
+    print(f'Preparing dataset from: {path_array}')
+    for f in tqdm(file_list):
+        data = np.load(os.path.join(path_array, f)).astype('float32')
+        sample_id = strip_suffix(f, channel)
+
+        if data.ndim == 3 and data.shape[1] == 1:
+            data = np.squeeze(data, axis=1)
+        elif data.ndim != 2:
+            raise ValueError(
+                f'[ERROR] Expected {f} to have shape [epochs, 1, samples] or [epochs, samples], '
+                f'got {data.shape}'
+            )
+
+        sample_ids.append(sample_id)
+        epoch_counts.append(data.shape[0])
+        data_list.append(data)
+
+    if not data_list:
+        raise ValueError(f'[ERROR] No .npy files found in {path_array}')
+
+    data_channel = np.concatenate(data_list, axis=0)
+    print(f'[INFO] Concatenated shape from {path_array}: {data_channel.shape}')
+    return data_channel, sample_ids, epoch_counts
+
+
+def infer_subject_id(sample_id):
+    """Infer Sleep-EDF subject id using the same 6-char key as prepare_dataset.py."""
+    match = SLEEP_EDF_SUBJECT_RE.match(sample_id)
+    if match:
+        return match.group(0)
+    return sample_id[:6] if len(sample_id) >= 6 else sample_id
+
+
 def spectrogram(x, window, n_overlap, nfft):
     """
     Transform to time-frequency images.
@@ -166,6 +214,114 @@ def data_normalize(dataset, channel, save_dir):
         print(f'[INFO] After normalization: mean={np.mean(dataset):.6f}, std={np.std(dataset):.6f}')
     else:
         print(f'[ERROR] {channel} still contains inf or nan, not saved.')
+        raise ValueError(f'[ERROR] {channel} still contains inf or nan after normalization.')
+
+    return dataset
+
+
+def transform_to_tf(data_channel, fs, overlap, nfft, win_size):
+    """Convert one concatenated raw channel to TF images."""
+    X = np.zeros([data_channel.shape[0], 29, int(nfft / 2)], dtype=np.float32)
+
+    print('Transform to TF images:')
+    for i in tqdm(range(data_channel.shape[0])):
+        Xi = spectrogram(data_channel[i, :], win_size * fs, overlap * fs, nfft)
+        Xi = 20 * np.log10(np.abs(Xi) + 1e-8)
+        X[i, :, :] = Xi[:, 1:129]
+
+    return X
+
+
+def save_per_file_tf(dataset, channel, sample_ids, epoch_counts, save_dir):
+    """Save normalized per-file TF arrays and return metadata paths."""
+    output_dir = os.path.join(save_dir, PER_FILE_DIR_NAME, channel)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if int(np.sum(epoch_counts)) != dataset.shape[0]:
+        raise ValueError(
+            f'[ERROR] {channel} epoch boundary total ({np.sum(epoch_counts)}) '
+            f'does not match dataset size ({dataset.shape[0]})'
+        )
+
+    paths = {}
+    offset = 0
+    for sample_id, num_epochs in zip(sample_ids, epoch_counts):
+        end = offset + num_epochs
+        sample_tf = dataset[offset:end]
+        if sample_tf.shape != (num_epochs, 29, 128):
+            raise ValueError(
+                f'[ERROR] {sample_id} {channel} TF shape mismatch: '
+                f'expected ({num_epochs}, 29, 128), got {sample_tf.shape}'
+            )
+
+        save_path = os.path.join(output_dir, f'{sample_id}_TF_{channel}_mean_std.npy')
+        np.save(save_path, sample_tf)
+        paths[sample_id] = os.path.relpath(save_path, save_dir)
+        offset = end
+
+    print(f'[INFO] Saved {len(paths)} per-file TF arrays for {channel} under {output_dir}')
+    return paths
+
+
+def save_per_file_labels(path_labels, save_dir, sample_ids, epoch_counts):
+    """Copy aligned labels into the per-file TF output tree."""
+    label_files = get_npy_file_list(path_labels)
+    label_sample_ids = [strip_suffix(f, 'labels') for f in label_files]
+    if label_sample_ids != sample_ids:
+        raise ValueError(
+            '[ERROR] Label sample order does not match channel sample order: '
+            f'labels={label_sample_ids[:5]}, channels={sample_ids[:5]}'
+        )
+
+    output_dir = os.path.join(save_dir, PER_FILE_DIR_NAME, 'labels')
+    os.makedirs(output_dir, exist_ok=True)
+
+    paths = {}
+    for f, sample_id, num_epochs in zip(label_files, sample_ids, epoch_counts):
+        labels = np.load(os.path.join(path_labels, f)).astype(np.int64)
+        if labels.shape != (num_epochs,):
+            raise ValueError(
+                f'[ERROR] {sample_id} label shape mismatch: '
+                f'expected ({num_epochs},), got {labels.shape}'
+            )
+
+        save_path = os.path.join(output_dir, f'{sample_id}_label.npy')
+        np.save(save_path, labels)
+        paths[sample_id] = os.path.relpath(save_path, save_dir)
+
+    print(f'[INFO] Saved {len(paths)} per-file label arrays under {output_dir}')
+    return paths
+
+
+def write_metadata(save_dir, sample_ids, epoch_counts, channel_paths, label_paths):
+    """Write per-file TF manifest for future context-window construction."""
+    metadata_path = os.path.join(save_dir, METADATA_FILE_NAME)
+    fieldnames = [
+        'sample_id',
+        'subject_id',
+        'num_epochs',
+        'EEG Fpz-Cz TF path',
+        'EEG Pz-Oz TF path',
+        'EOG TF path',
+        'label path',
+    ]
+
+    with open(metadata_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for sample_id, num_epochs in zip(sample_ids, epoch_counts):
+            writer.writerow({
+                'sample_id': sample_id,
+                'subject_id': infer_subject_id(sample_id),
+                'num_epochs': int(num_epochs),
+                'EEG Fpz-Cz TF path': channel_paths['EEG_Fpz-Cz'][sample_id],
+                'EEG Pz-Oz TF path': channel_paths['EEG_Pz-Oz'][sample_id],
+                'EOG TF path': channel_paths['EOG'][sample_id],
+                'label path': label_paths[sample_id],
+            })
+
+    print(f'[INFO] Saved per-file TF metadata: {metadata_path}')
+    return metadata_path
 
 
 if __name__ == '__main__':
@@ -182,22 +338,52 @@ if __name__ == '__main__':
     # 2. 检查 labels 总体分布
     check_label_distribution(os.path.join(path.path_raw_data, 'labels'))
 
-    # 3. 处理三个通道的 TF 图
-    for channel in ['EEG_Fpz-Cz', 'EEG_Pz-Oz', 'EOG']:
+    os.makedirs(path.path_TF, exist_ok=True)
+
+    # 3. 处理三个通道的 TF 图；保留旧全局输出，同时保存 per-file 输出和 metadata。
+    reference_sample_ids = None
+    reference_epoch_counts = None
+    channel_paths = {}
+
+    for channel in CHANNELS:
         print('\n' + '-' * 15, f'Processing channel: {channel}', '-' * 15)
 
-        data_channel = data_array_concat(path_array=os.path.join(path.path_raw_data, channel))
-        X = np.zeros([data_channel.shape[0], 29, int(nfft / 2)], dtype=np.float32)
+        data_channel, sample_ids, epoch_counts = load_channel_data_with_boundaries(
+            path_array=os.path.join(path.path_raw_data, channel),
+            channel=channel
+        )
 
-        print('Transform to TF images:')
-        for i in tqdm(range(data_channel.shape[0])):
-            Xi = spectrogram(data_channel[i, :], win_size * fs, overlap * fs, nfft)
-            Xi = 20 * np.log10(np.abs(Xi) + 1e-8)
-            X[i, :, :] = Xi[:, 1:129]
+        if reference_sample_ids is None:
+            reference_sample_ids = sample_ids
+            reference_epoch_counts = epoch_counts
+        elif sample_ids != reference_sample_ids or epoch_counts != reference_epoch_counts:
+            raise ValueError(f'[ERROR] {channel} file boundaries do not match the reference channel.')
 
+        X = transform_to_tf(data_channel, fs=fs, overlap=overlap, nfft=nfft, win_size=win_size)
         print(f'[INFO] TF image shape for {channel}: {X.shape}')
         print('Normalize:')
-        data_normalize(dataset=X, channel=channel, save_dir=path.path_TF)
+        X = data_normalize(dataset=X, channel=channel, save_dir=path.path_TF)
+        channel_paths[channel] = save_per_file_tf(
+            dataset=X,
+            channel=channel,
+            sample_ids=sample_ids,
+            epoch_counts=epoch_counts,
+            save_dir=path.path_TF
+        )
+
+    label_paths = save_per_file_labels(
+        path_labels=os.path.join(path.path_raw_data, 'labels'),
+        save_dir=path.path_TF,
+        sample_ids=reference_sample_ids,
+        epoch_counts=reference_epoch_counts
+    )
+    write_metadata(
+        save_dir=path.path_TF,
+        sample_ids=reference_sample_ids,
+        epoch_counts=reference_epoch_counts,
+        channel_paths=channel_paths,
+        label_paths=label_paths
+    )
 
 
 '''

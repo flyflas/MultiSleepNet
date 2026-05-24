@@ -113,3 +113,5 @@ class Path(object):
         self.path_raw_data = os.path.join(old_root, 'data/sleepEDF-78/data_array/raw_data')
         self.path_labels = os.path.join(old_root, 'data/sleepEDF-78/data_array/raw_data/labels')
         self.path_TF = os.path.join(old_root, 'data/sleepEDF-78/data_array/TF_data')
+        self.path_TF_per_file = os.path.join(self.path_TF, 'per_file')
+        self.path_TF_metadata = os.path.join(self.path_TF, 'tf_per_file_metadata.csv')
