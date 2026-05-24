@@ -11,7 +11,35 @@ import torch
 
 def _get_int_env(name, default):
     value = os.getenv(name, '').strip()
-    return int(value) if value else default
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f'{name} must be an integer, got {value!r}') from exc
+
+
+def _get_optional_int_env(name, default=None):
+    value = os.getenv(name, '').strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f'{name} must be an integer, got {value!r}') from exc
+    if parsed <= 0:
+        raise ValueError(f'{name} must be a positive integer, got {parsed}')
+    return parsed
+
+
+def _get_float_env(name, default):
+    value = os.getenv(name, '').strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f'{name} must be a float, got {value!r}') from exc
 
 
 class Config(object):
@@ -21,6 +49,10 @@ class Config(object):
 
         # basic training settings
         self.num_fold = _get_int_env('MCSN_NUM_FOLD', 10)
+        self.val_ratio = _get_float_env('MCSN_VAL_RATIO', 0.1)
+        if not 0.0 < self.val_ratio < 1.0:
+            raise ValueError(f'MCSN_VAL_RATIO must be between 0 and 1, got {self.val_ratio}')
+        self.max_folds_to_run = _get_optional_int_env('MCSN_MAX_FOLDS_TO_RUN', None)
         self.num_classes = 5
         self.num_epochs = _get_int_env('MCSN_NUM_EPOCHS', 45)
         self.batch_size = _get_int_env('MCSN_BATCH_SIZE', 512)

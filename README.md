@@ -30,10 +30,17 @@ Copy `.env.example` to `.env` for local overrides. These values can be configure
 
 ```dotenv
 MCSN_NUM_FOLD=10
+MCSN_VAL_RATIO=0.1
+MCSN_MAX_FOLDS_TO_RUN=
 MCSN_NUM_EPOCHS=45
 MCSN_DATA_ROOT=/openbayes/home/MultiChannelSleepNet
 MCSN_BATCH_SIZE=512
 ```
+
+`MCSN_VAL_RATIO` controls the single global held-out validation split made before K-fold training.
+`MCSN_NUM_FOLD` only controls the Stratified K-fold count over the remaining train/test data.
+For quick runs, keep the formal split stable with `MCSN_NUM_FOLD=10` and set
+`MCSN_MAX_FOLDS_TO_RUN=2` or `MCSN_MAX_FOLDS_TO_RUN=3` to train only a few unfinished folds in one invocation.
 
 ## File Naming
 

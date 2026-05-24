@@ -22,6 +22,8 @@ from mlflow_utils import MLflowTracker
 
 CLASS_NAMES = ['Wake', 'N1', 'N2', 'N3', 'REM']
 SPLIT_METADATA_FILE = 'split_metadata.npz'
+SPLIT_RANDOM_STATE = 0
+SPLIT_SHUFFLE = True
 
 
 def specificity(y_true, y_pred, n=5):
@@ -139,11 +141,15 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
     required_keys = {
         'fold_index',
         'num_fold',
+        'val_ratio',
         'random_state',
         'shuffle',
+        'train_idx',
         'test_idx',
         'dataset_shape',
         'labels_shape',
+        'train_test_dataset_shape',
+        'train_test_labels_shape',
     }
     missing_keys = sorted(required_keys - set(metadata.files))
     if missing_keys:
@@ -151,8 +157,12 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
 
     metadata_fold = int(metadata['fold_index'])
     metadata_num_fold = int(metadata['num_fold'])
+    metadata_val_ratio = float(metadata['val_ratio'])
     metadata_dataset_shape = tuple(int(v) for v in metadata['dataset_shape'])
     metadata_labels_shape = tuple(int(v) for v in metadata['labels_shape'])
+    metadata_train_test_dataset_shape = tuple(int(v) for v in metadata['train_test_dataset_shape'])
+    metadata_train_test_labels_shape = tuple(int(v) for v in metadata['train_test_labels_shape'])
+    train_idx = np.asarray(metadata['train_idx'], dtype=np.int64)
     test_idx = np.asarray(metadata['test_idx'], dtype=np.int64)
 
     if metadata_fold != fold:
@@ -162,6 +172,15 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
             f'[ERROR] fold {fold} was trained with num_fold={metadata_num_fold}, '
             f'but current config.num_fold={config.num_fold}. Refusing to evaluate mixed split definitions.'
         )
+    if int(metadata['random_state']) != SPLIT_RANDOM_STATE:
+        raise RuntimeError(f'[ERROR] fold {fold} random_state mismatch in split metadata.')
+    if bool(metadata['shuffle']) != SPLIT_SHUFFLE:
+        raise RuntimeError(f'[ERROR] fold {fold} shuffle mismatch in split metadata.')
+    if not np.isclose(metadata_val_ratio, config.val_ratio):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} was trained with val_ratio={metadata_val_ratio}, '
+            f'but current config.val_ratio={config.val_ratio}. Refusing to evaluate mixed split definitions.'
+        )
     if metadata_dataset_shape != tuple(dataset.shape):
         raise RuntimeError(
             f'[ERROR] fold {fold} dataset shape mismatch: trained={metadata_dataset_shape}, current={tuple(dataset.shape)}.'
@@ -170,8 +189,22 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
         raise RuntimeError(
             f'[ERROR] fold {fold} labels shape mismatch: trained={metadata_labels_shape}, current={tuple(labels.shape)}.'
         )
+    if metadata_train_test_dataset_shape != tuple(dataset.shape):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} train_test dataset shape mismatch: '
+            f'trained={metadata_train_test_dataset_shape}, current={tuple(dataset.shape)}.'
+        )
+    if metadata_train_test_labels_shape != tuple(labels.shape):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} train_test labels shape mismatch: '
+            f'trained={metadata_train_test_labels_shape}, current={tuple(labels.shape)}.'
+        )
+    if len(train_idx) == 0 or np.any(train_idx < 0) or np.any(train_idx >= len(labels)):
+        raise RuntimeError(f'[ERROR] fold {fold} metadata has invalid train_idx bounds.')
     if len(test_idx) == 0 or np.any(test_idx < 0) or np.any(test_idx >= len(labels)):
         raise RuntimeError(f'[ERROR] fold {fold} metadata has invalid test_idx bounds.')
+    if np.intersect1d(train_idx, test_idx).size > 0:
+        raise RuntimeError(f'[ERROR] fold {fold} metadata has overlapping train_idx and test_idx.')
 
     return test_idx
 
@@ -261,10 +294,13 @@ def evaluate(config, path, tracker=None):
     with tracker.start_run(run_name=config.mlflow_run_name or 'evaluate') as _:
         tracker.log_params({
             'num_fold': config.num_fold,
+            'val_ratio': config.val_ratio,
             'num_classes': config.num_classes,
             'batch_size': config.batch_size,
             'dataset_shape': tuple(dataset.shape),
             'labels_shape': tuple(labels.shape),
+            'train_test_dataset_shape': tuple(dataset.shape),
+            'train_test_labels_shape': tuple(labels.shape),
             'dataset_size': len(labels),
             'device': config.device,
         })

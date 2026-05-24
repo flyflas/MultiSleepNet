@@ -56,6 +56,8 @@ def label_distribution(labels):
 def log_config_params(tracker, config):
     tracker.log_params({
         'num_fold': config.num_fold,
+        'val_ratio': config.val_ratio,
+        'max_folds_to_run': config.max_folds_to_run,
         'num_classes': config.num_classes,
         'num_epochs': config.num_epochs,
         'batch_size': config.batch_size,
@@ -92,12 +94,15 @@ def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, la
         os.path.join(fold_dir, SPLIT_METADATA_FILE),
         fold_index=np.array(fold, dtype=np.int64),
         num_fold=np.array(config.num_fold, dtype=np.int64),
+        val_ratio=np.array(config.val_ratio, dtype=np.float64),
         random_state=np.array(SPLIT_RANDOM_STATE, dtype=np.int64),
         shuffle=np.array(SPLIT_SHUFFLE, dtype=np.bool_),
         train_idx=np.asarray(train_idx, dtype=np.int64),
         test_idx=np.asarray(test_idx, dtype=np.int64),
         dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
         labels_shape=np.asarray(labels.shape, dtype=np.int64),
+        train_test_dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
+        train_test_labels_shape=np.asarray(labels.shape, dtype=np.int64),
     )
 
 
@@ -110,15 +115,44 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
         )
 
     metadata = np.load(metadata_path)
+    required_keys = {
+        'fold_index',
+        'num_fold',
+        'val_ratio',
+        'random_state',
+        'shuffle',
+        'train_idx',
+        'test_idx',
+        'dataset_shape',
+        'labels_shape',
+        'train_test_dataset_shape',
+        'train_test_labels_shape',
+    }
+    missing_keys = sorted(required_keys - set(metadata.files))
+    if missing_keys:
+        raise RuntimeError(
+            f'[ERROR] Existing fold {fold} split metadata is missing keys: {missing_keys}. '
+            'Use a separate Kfold_models directory or regenerate folds.'
+        )
+
     checks = {
         'fold_index': int(metadata['fold_index']) == fold,
         'num_fold': int(metadata['num_fold']) == config.num_fold,
+        'val_ratio': np.isclose(float(metadata['val_ratio']), config.val_ratio),
         'random_state': int(metadata['random_state']) == SPLIT_RANDOM_STATE,
         'shuffle': bool(metadata['shuffle']) == SPLIT_SHUFFLE,
         'train_idx': np.array_equal(metadata['train_idx'], np.asarray(train_idx, dtype=np.int64)),
         'test_idx': np.array_equal(metadata['test_idx'], np.asarray(test_idx, dtype=np.int64)),
         'dataset_shape': np.array_equal(metadata['dataset_shape'], np.asarray(dataset.shape, dtype=np.int64)),
         'labels_shape': np.array_equal(metadata['labels_shape'], np.asarray(labels.shape, dtype=np.int64)),
+        'train_test_dataset_shape': np.array_equal(
+            metadata['train_test_dataset_shape'],
+            np.asarray(dataset.shape, dtype=np.int64)
+        ),
+        'train_test_labels_shape': np.array_equal(
+            metadata['train_test_labels_shape'],
+            np.asarray(labels.shape, dtype=np.int64)
+        ),
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -232,6 +266,10 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] batch_size = {config.batch_size}')
     print(f'[INFO] learning_rate = {config.learning_rate}')
     print(f'[INFO] num_epochs = {config.num_epochs}')
+    print(f'[INFO] num_fold = {config.num_fold}')
+    print(f'[INFO] val_ratio = {config.val_ratio}')
+    if config.max_folds_to_run is not None:
+        print(f'[INFO] max_folds_to_run = {config.max_folds_to_run} (limits newly trained folds only)')
 
     dataset, labels, val_loader = data_generator(
         path_labels=path.path_labels,
@@ -262,12 +300,17 @@ def train(save_all_checkpoint=False, start_fold=None):
             'dataset_shape': tuple(dataset.shape),
             'labels_shape': tuple(labels.shape),
             'dataset_size': len(labels),
+            'train_test_dataset_shape': tuple(dataset.shape),
+            'train_test_labels_shape': tuple(labels.shape),
+            'val_ratio': config.val_ratio,
+            'max_folds_to_run': config.max_folds_to_run,
             'save_all_checkpoint': save_all_checkpoint,
             'start_fold': start_fold,
         })
         tracker.log_params({f'full_distribution_{k}': v for k, v in label_distribution(labels).items()})
 
         any_fold_trained = False
+        newly_trained_folds = 0
 
         for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
             fold_dir = f'./Kfold_models/fold{fold}'
@@ -275,6 +318,8 @@ def train(save_all_checkpoint=False, start_fold=None):
 
             # 1) 小于 start_fold 的一律跳过
             if fold < start_fold:
+                if is_fold_finished(fold_dir):
+                    validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
                 print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
                 continue
 
@@ -292,6 +337,16 @@ def train(save_all_checkpoint=False, start_fold=None):
                     f'[ERROR] Fold {fold} has existing outputs but no {SPLIT_METADATA_FILE}. '
                     'Refusing to continue because the split for existing artifacts cannot be verified.'
                 )
+
+            if (
+                config.max_folds_to_run is not None
+                and newly_trained_folds >= config.max_folds_to_run
+            ):
+                print(
+                    f'[INFO] Reached max_folds_to_run={config.max_folds_to_run}; '
+                    'stopping this invocation.'
+                )
+                break
 
             any_fold_trained = True
 
@@ -476,6 +531,7 @@ def train(save_all_checkpoint=False, start_fold=None):
 
                 del model
                 torch.cuda.empty_cache()
+                newly_trained_folds += 1
 
         if not any_fold_trained:
             print('[INFO] All discovered folds are already finished. Nothing to do.')

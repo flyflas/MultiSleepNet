@@ -74,7 +74,8 @@ def data_generator(path_labels, path_dataset):
     X_train_test, X_val, y_train_test, y_val = train_test_split(
         dataset,
         labels,
-        test_size=1 / (config.num_fold + 1),
+        # This test_size is the held-out validation ratio, not the K-fold test ratio.
+        test_size=config.val_ratio,
         random_state=0,
         stratify=labels
     )
