@@ -129,7 +129,16 @@ def find_trained_fold_dirs(root='./Kfold_models'):
     return sorted(fold_dirs, key=lambda item: item[0])
 
 
-def load_split_metadata(fold, fold_dir, config, dataset, labels):
+def split_window_identity(window_meta, indices):
+    selected = [window_meta[int(index)] for index in indices]
+    sample_ids = np.asarray([meta['sample_id'] for meta in selected], dtype=str)
+    subject_ids = np.asarray([meta['subject_id'] for meta in selected], dtype=str)
+    center_epoch_indices = np.asarray([int(meta['center_epoch_index']) for meta in selected], dtype=np.int64)
+    labels = np.asarray([int(meta['label']) for meta in selected], dtype=np.int64)
+    return sample_ids, subject_ids, center_epoch_indices, labels
+
+
+def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, window_meta=None):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
         raise RuntimeError(
@@ -151,6 +160,30 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
         'train_test_dataset_shape',
         'train_test_labels_shape',
     }
+    if groups is not None:
+        required_keys.update({
+            'groups_shape',
+            'train_groups',
+            'test_groups',
+            'group_granularity',
+            'group_split_enforced',
+        })
+    if dataset.dim() == 5:
+        if window_meta is None:
+            raise RuntimeError(f'[ERROR] fold {fold} cannot validate context split identity without window metadata.')
+        required_keys.update({
+            'context_size',
+            'left_context',
+            'right_context',
+            'train_sample_ids',
+            'test_sample_ids',
+            'train_subject_ids',
+            'test_subject_ids',
+            'train_center_epoch_indices',
+            'test_center_epoch_indices',
+            'train_window_labels',
+            'test_window_labels',
+        })
     missing_keys = sorted(required_keys - set(metadata.files))
     if missing_keys:
         raise RuntimeError(f'[ERROR] fold {fold} split metadata is missing keys: {missing_keys}')
@@ -205,6 +238,53 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels):
         raise RuntimeError(f'[ERROR] fold {fold} metadata has invalid test_idx bounds.')
     if np.intersect1d(train_idx, test_idx).size > 0:
         raise RuntimeError(f'[ERROR] fold {fold} metadata has overlapping train_idx and test_idx.')
+
+    if groups is not None:
+        groups = np.asarray(groups)
+        if not np.array_equal(metadata['groups_shape'], np.asarray(groups.shape, dtype=np.int64)):
+            raise RuntimeError(f'[ERROR] fold {fold} groups shape mismatch in split metadata.')
+        if not np.array_equal(metadata['train_groups'].astype(str), groups[train_idx].astype(str)):
+            raise RuntimeError(f'[ERROR] fold {fold} train group identity mismatch in split metadata.')
+        if not np.array_equal(metadata['test_groups'].astype(str), groups[test_idx].astype(str)):
+            raise RuntimeError(f'[ERROR] fold {fold} test group identity mismatch in split metadata.')
+        if str(np.asarray(metadata['group_granularity']).item()) != 'subject_id':
+            raise RuntimeError(f'[ERROR] fold {fold} group granularity mismatch in split metadata.')
+        if bool(metadata['group_split_enforced']) is not False:
+            raise RuntimeError(f'[ERROR] fold {fold} group split flag mismatch in split metadata.')
+
+    if dataset.dim() == 5:
+        train_sample_ids, train_subject_ids, train_center_epoch_indices, train_window_labels = split_window_identity(
+            window_meta,
+            train_idx
+        )
+        test_sample_ids, test_subject_ids, test_center_epoch_indices, test_window_labels = split_window_identity(
+            window_meta,
+            test_idx
+        )
+        context_checks = {
+            'context_size': int(metadata['context_size']) == 5,
+            'left_context': int(metadata['left_context']) == 2,
+            'right_context': int(metadata['right_context']) == 2,
+            'train_sample_ids': np.array_equal(metadata['train_sample_ids'].astype(str), train_sample_ids),
+            'test_sample_ids': np.array_equal(metadata['test_sample_ids'].astype(str), test_sample_ids),
+            'train_subject_ids': np.array_equal(metadata['train_subject_ids'].astype(str), train_subject_ids),
+            'test_subject_ids': np.array_equal(metadata['test_subject_ids'].astype(str), test_subject_ids),
+            'train_center_epoch_indices': np.array_equal(
+                metadata['train_center_epoch_indices'],
+                train_center_epoch_indices
+            ),
+            'test_center_epoch_indices': np.array_equal(
+                metadata['test_center_epoch_indices'],
+                test_center_epoch_indices
+            ),
+            'train_window_labels': np.array_equal(metadata['train_window_labels'], train_window_labels),
+            'test_window_labels': np.array_equal(metadata['test_window_labels'], test_window_labels),
+        }
+        failed_context_checks = [name for name, passed in context_checks.items() if not passed]
+        if failed_context_checks:
+            raise RuntimeError(
+                f'[ERROR] fold {fold} context split identity mismatch: {", ".join(failed_context_checks)}.'
+            )
 
     return test_idx
 
@@ -286,10 +366,17 @@ def evaluate(config, path, tracker=None):
     if tracker is None:
         tracker = MLflowTracker(config)
 
-    dataset, labels, _ = data_generator(
+    dataset, labels, groups, window_meta, _, val_window_meta = data_generator(
         path_labels=path.path_labels,
         path_dataset=path.path_TF
     )
+
+    if dataset.dim() == 5:
+        raise RuntimeError(
+            '[ERROR] Context windows were built with shape [N, 5, 3, 29, 128], '
+            'but evaluate.py still uses the current Transformer expecting [N, 3, 29, 128]. '
+            'Milestone 5 must update model.py before context evaluation can run.'
+        )
 
     with tracker.start_run(run_name=config.mlflow_run_name or 'evaluate') as _:
         tracker.log_params({
@@ -301,6 +388,9 @@ def evaluate(config, path, tracker=None):
             'labels_shape': tuple(labels.shape),
             'train_test_dataset_shape': tuple(dataset.shape),
             'train_test_labels_shape': tuple(labels.shape),
+            'groups_shape': tuple(groups.shape),
+            'window_meta_rows': len(window_meta),
+            'val_window_meta_rows': len(val_window_meta),
             'dataset_size': len(labels),
             'device': config.device,
         })
@@ -321,7 +411,7 @@ def evaluate(config, path, tracker=None):
             raise RuntimeError('[ERROR] No trained fold models found.')
 
         for fold, fold_dir in trained_folds:
-            test_idx = load_split_metadata(fold, fold_dir, config, dataset, labels)
+            test_idx = load_split_metadata(fold, fold_dir, config, dataset, labels, groups, window_meta)
 
             print('\n' + '-' * 15, '>', f'Fold {fold}', '<', '-' * 15)
 

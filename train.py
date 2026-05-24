@@ -89,24 +89,93 @@ def log_fold_artifacts(tracker, fold_dir):
             tracker.log_artifact(os.path.join(fold_dir, filename), artifact_path=os.path.basename(fold_dir))
 
 
-def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels):
+def split_window_identity(window_meta, indices):
+    selected = [window_meta[int(index)] for index in indices]
+    sample_ids = np.asarray([meta['sample_id'] for meta in selected], dtype=str)
+    subject_ids = np.asarray([meta['subject_id'] for meta in selected], dtype=str)
+    center_epoch_indices = np.asarray([int(meta['center_epoch_index']) for meta in selected], dtype=np.int64)
+    labels = np.asarray([int(meta['label']) for meta in selected], dtype=np.int64)
+    return sample_ids, subject_ids, center_epoch_indices, labels
+
+
+def assert_model_supports_dataset_shape(dataset):
+    if dataset.dim() == 5:
+        raise RuntimeError(
+            '[ERROR] Context windows were built with shape [N, 5, 3, 29, 128], '
+            'but the current Transformer still expects [N, 3, 29, 128]. '
+            'Milestone 5 must update model.py before context training can run.'
+        )
+    if dataset.dim() != 4:
+        raise RuntimeError(
+            f'[ERROR] Unsupported dataset rank {dataset.dim()} for training: shape={tuple(dataset.shape)}'
+        )
+
+
+def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels, groups=None, window_meta=None):
+    metadata = {
+        'fold_index': np.array(fold, dtype=np.int64),
+        'num_fold': np.array(config.num_fold, dtype=np.int64),
+        'val_ratio': np.array(config.val_ratio, dtype=np.float64),
+        'random_state': np.array(SPLIT_RANDOM_STATE, dtype=np.int64),
+        'shuffle': np.array(SPLIT_SHUFFLE, dtype=np.bool_),
+        'train_idx': np.asarray(train_idx, dtype=np.int64),
+        'test_idx': np.asarray(test_idx, dtype=np.int64),
+        'dataset_shape': np.asarray(dataset.shape, dtype=np.int64),
+        'labels_shape': np.asarray(labels.shape, dtype=np.int64),
+        'train_test_dataset_shape': np.asarray(dataset.shape, dtype=np.int64),
+        'train_test_labels_shape': np.asarray(labels.shape, dtype=np.int64),
+    }
+
+    if groups is not None:
+        groups = np.asarray(groups)
+        metadata.update({
+            'groups_shape': np.asarray(groups.shape, dtype=np.int64),
+            'train_groups': groups[np.asarray(train_idx, dtype=np.int64)].astype(str),
+            'test_groups': groups[np.asarray(test_idx, dtype=np.int64)].astype(str),
+            'group_granularity': np.array('subject_id'),
+            'group_split_enforced': np.array(False, dtype=np.bool_),
+        })
+
+    if window_meta is not None:
+        train_sample_ids, train_subject_ids, train_center_epoch_indices, train_window_labels = split_window_identity(
+            window_meta,
+            train_idx
+        )
+        test_sample_ids, test_subject_ids, test_center_epoch_indices, test_window_labels = split_window_identity(
+            window_meta,
+            test_idx
+        )
+        metadata.update({
+            'context_size': np.array(5, dtype=np.int64),
+            'left_context': np.array(2, dtype=np.int64),
+            'right_context': np.array(2, dtype=np.int64),
+            'train_sample_ids': train_sample_ids,
+            'test_sample_ids': test_sample_ids,
+            'train_subject_ids': train_subject_ids,
+            'test_subject_ids': test_subject_ids,
+            'train_center_epoch_indices': train_center_epoch_indices,
+            'test_center_epoch_indices': test_center_epoch_indices,
+            'train_window_labels': train_window_labels,
+            'test_window_labels': test_window_labels,
+        })
+
     np.savez(
         os.path.join(fold_dir, SPLIT_METADATA_FILE),
-        fold_index=np.array(fold, dtype=np.int64),
-        num_fold=np.array(config.num_fold, dtype=np.int64),
-        val_ratio=np.array(config.val_ratio, dtype=np.float64),
-        random_state=np.array(SPLIT_RANDOM_STATE, dtype=np.int64),
-        shuffle=np.array(SPLIT_SHUFFLE, dtype=np.bool_),
-        train_idx=np.asarray(train_idx, dtype=np.int64),
-        test_idx=np.asarray(test_idx, dtype=np.int64),
-        dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
-        labels_shape=np.asarray(labels.shape, dtype=np.int64),
-        train_test_dataset_shape=np.asarray(dataset.shape, dtype=np.int64),
-        train_test_labels_shape=np.asarray(labels.shape, dtype=np.int64),
+        **metadata,
     )
 
 
-def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels):
+def validate_existing_split_metadata(
+    fold_dir,
+    fold,
+    config,
+    train_idx,
+    test_idx,
+    dataset,
+    labels,
+    groups=None,
+    window_meta=None,
+):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
         raise RuntimeError(
@@ -128,6 +197,32 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
         'train_test_dataset_shape',
         'train_test_labels_shape',
     }
+    if groups is not None:
+        required_keys.update({
+            'groups_shape',
+            'train_groups',
+            'test_groups',
+            'group_granularity',
+            'group_split_enforced',
+        })
+    if dataset.dim() == 5:
+        if window_meta is None:
+            raise RuntimeError(
+                f'[ERROR] Existing fold {fold} cannot validate context split identity without window metadata.'
+            )
+        required_keys.update({
+            'context_size',
+            'left_context',
+            'right_context',
+            'train_sample_ids',
+            'test_sample_ids',
+            'train_subject_ids',
+            'test_subject_ids',
+            'train_center_epoch_indices',
+            'test_center_epoch_indices',
+            'train_window_labels',
+            'test_window_labels',
+        })
     missing_keys = sorted(required_keys - set(metadata.files))
     if missing_keys:
         raise RuntimeError(
@@ -154,6 +249,49 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
             np.asarray(labels.shape, dtype=np.int64)
         ),
     }
+    if groups is not None:
+        groups = np.asarray(groups)
+        checks.update({
+            'groups_shape': np.array_equal(metadata['groups_shape'], np.asarray(groups.shape, dtype=np.int64)),
+            'train_groups': np.array_equal(
+                metadata['train_groups'],
+                groups[np.asarray(train_idx, dtype=np.int64)].astype(str)
+            ),
+            'test_groups': np.array_equal(
+                metadata['test_groups'],
+                groups[np.asarray(test_idx, dtype=np.int64)].astype(str)
+            ),
+            'group_granularity': str(np.asarray(metadata['group_granularity']).item()) == 'subject_id',
+            'group_split_enforced': bool(metadata['group_split_enforced']) is False,
+        })
+    if dataset.dim() == 5:
+        train_sample_ids, train_subject_ids, train_center_epoch_indices, train_window_labels = split_window_identity(
+            window_meta,
+            train_idx
+        )
+        test_sample_ids, test_subject_ids, test_center_epoch_indices, test_window_labels = split_window_identity(
+            window_meta,
+            test_idx
+        )
+        checks.update({
+            'context_size': int(metadata['context_size']) == 5,
+            'left_context': int(metadata['left_context']) == 2,
+            'right_context': int(metadata['right_context']) == 2,
+            'train_sample_ids': np.array_equal(metadata['train_sample_ids'].astype(str), train_sample_ids),
+            'test_sample_ids': np.array_equal(metadata['test_sample_ids'].astype(str), test_sample_ids),
+            'train_subject_ids': np.array_equal(metadata['train_subject_ids'].astype(str), train_subject_ids),
+            'test_subject_ids': np.array_equal(metadata['test_subject_ids'].astype(str), test_subject_ids),
+            'train_center_epoch_indices': np.array_equal(
+                metadata['train_center_epoch_indices'],
+                train_center_epoch_indices
+            ),
+            'test_center_epoch_indices': np.array_equal(
+                metadata['test_center_epoch_indices'],
+                test_center_epoch_indices
+            ),
+            'train_window_labels': np.array_equal(metadata['train_window_labels'], train_window_labels),
+            'test_window_labels': np.array_equal(metadata['test_window_labels'], test_window_labels),
+        })
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise RuntimeError(
@@ -271,14 +409,18 @@ def train(save_all_checkpoint=False, start_fold=None):
     if config.max_folds_to_run is not None:
         print(f'[INFO] max_folds_to_run = {config.max_folds_to_run} (limits newly trained folds only)')
 
-    dataset, labels, val_loader = data_generator(
+    dataset, labels, groups, window_meta, val_loader, val_window_meta = data_generator(
         path_labels=path.path_labels,
         path_dataset=path.path_TF
     )
 
     print(f'[INFO] dataset shape: {dataset.shape}')
     print(f'[INFO] labels shape: {labels.shape}')
+    print(f'[INFO] groups shape: {groups.shape}')
+    print(f'[INFO] window metadata rows: {len(window_meta)}')
+    print(f'[INFO] val window metadata rows: {len(val_window_meta)}')
     print_label_distribution(labels, split_name='full dataset')
+    assert_model_supports_dataset_shape(dataset)
 
     kf = StratifiedKFold(
         n_splits=config.num_fold,
@@ -302,10 +444,16 @@ def train(save_all_checkpoint=False, start_fold=None):
             'dataset_size': len(labels),
             'train_test_dataset_shape': tuple(dataset.shape),
             'train_test_labels_shape': tuple(labels.shape),
+            'groups_shape': tuple(groups.shape),
+            'window_meta_rows': len(window_meta),
+            'val_window_meta_rows': len(val_window_meta),
             'val_ratio': config.val_ratio,
             'max_folds_to_run': config.max_folds_to_run,
             'save_all_checkpoint': save_all_checkpoint,
             'start_fold': start_fold,
+            'context_size': 5,
+            'group_granularity': 'subject_id',
+            'group_split_enforced': False,
         })
         tracker.log_params({f'full_distribution_{k}': v for k, v in label_distribution(labels).items()})
 
@@ -319,19 +467,49 @@ def train(save_all_checkpoint=False, start_fold=None):
             # 1) 小于 start_fold 的一律跳过
             if fold < start_fold:
                 if is_fold_finished(fold_dir):
-                    validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                    validate_existing_split_metadata(
+                        fold_dir,
+                        fold,
+                        config,
+                        train_idx,
+                        test_idx,
+                        dataset,
+                        labels,
+                        groups,
+                        window_meta,
+                    )
                 print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
                 continue
 
             # 2) 如果该 fold 已完整完成，也跳过
             if is_fold_finished(fold_dir):
-                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                validate_existing_split_metadata(
+                    fold_dir,
+                    fold,
+                    config,
+                    train_idx,
+                    test_idx,
+                    dataset,
+                    labels,
+                    groups,
+                    window_meta,
+                )
                 print(f'[INFO] Skip fold {fold} (already finished).')
                 continue
 
             metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
             if os.path.exists(metadata_path):
-                validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+                validate_existing_split_metadata(
+                    fold_dir,
+                    fold,
+                    config,
+                    train_idx,
+                    test_idx,
+                    dataset,
+                    labels,
+                    groups,
+                    window_meta,
+                )
             elif has_fold_outputs(fold_dir):
                 raise RuntimeError(
                     f'[ERROR] Fold {fold} has existing outputs but no {SPLIT_METADATA_FILE}. '
@@ -354,10 +532,14 @@ def train(save_all_checkpoint=False, start_fold=None):
 
             X_train, X_test = dataset[train_idx], dataset[test_idx]
             y_train, y_test = labels[train_idx], labels[test_idx]
-            save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels)
+            save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels, groups, window_meta)
 
             print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
             print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
+            print(
+                f'[INFO][fold {fold}] group-aware split is not enforced in Milestone 3; '
+                'groups are preserved for Milestone 4.'
+            )
 
             print_label_distribution(y_train, split_name=f'fold {fold} train')
             print_label_distribution(y_test, split_name=f'fold {fold} test')
