@@ -87,7 +87,7 @@ def print_class_wise_result(class_wise_result, class_names=CLASS_NAMES):
         print(f'{name:<8} {precision:>10.4f} {recall:>10.4f} {f1:>10.4f} {spec:>10.4f} {int(support):>10}')
 
 
-def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir='./Kfold_models/evaluation'):
+def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     confusion_path = os.path.join(output_dir, 'confusion_matrix.npy')
@@ -110,7 +110,7 @@ def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir='./Kf
     return [confusion_path, class_wise_path, class_wise_csv_path]
 
 
-def find_trained_fold_dirs(root='./Kfold_models'):
+def find_trained_fold_dirs(root):
     if not os.path.isdir(root):
         return []
 
@@ -269,8 +269,8 @@ def test(model, test_loader, config):
     )
 
 
-def evaluate_single_fold(config, tf_dataset, sse_dataset, labels, fold, test_idx):
-    path_model = f'./Kfold_models/fold{fold}/model.pkl'
+def evaluate_single_fold(config, tf_dataset, sse_dataset, labels, fold, fold_dir, test_idx):
+    path_model = os.path.join(fold_dir, 'model.pkl')
     if not os.path.exists(path_model):
         raise FileNotFoundError(f'Model not found: {path_model}')
 
@@ -312,6 +312,11 @@ def evaluate(config, path, tracker=None):
             'val_ratio': config.val_ratio,
             'num_classes': config.num_classes,
             'batch_size': config.batch_size,
+            'sse_window_size': config.sse_window_size,
+            'sse_num_windows': config.sse_num_windows,
+            'sse_num_encoder': config.sse_num_encoder,
+            'fusion_type': config.fusion_type,
+            'checkpoint_dir': config.checkpoint_dir,
             'tf_dataset_shape': tuple(tf_dataset.shape),
             'sse_dataset_shape': tuple(sse_dataset.shape),
             'labels_shape': tuple(labels.shape),
@@ -333,7 +338,7 @@ def evaluate(config, path, tracker=None):
 
         valid_folds = []
 
-        trained_folds = find_trained_fold_dirs()
+        trained_folds = find_trained_fold_dirs(root=config.checkpoint_dir)
         if len(trained_folds) == 0:
             raise RuntimeError('[ERROR] No trained fold models found.')
 
@@ -352,7 +357,7 @@ def evaluate(config, path, tracker=None):
                 balanced_acc,
                 con_mat,
                 class_wise_fold
-            ) = evaluate_single_fold(config, tf_dataset, sse_dataset, labels, fold, test_idx)
+            ) = evaluate_single_fold(config, tf_dataset, sse_dataset, labels, fold, fold_dir, test_idx)
 
             tracker.log_metrics({
                 f'fold_{fold}_acc': accuracy,
@@ -364,7 +369,7 @@ def evaluate(config, path, tracker=None):
                 f'fold_{fold}_balanced_accuracy': balanced_acc,
             })
 
-            fold_artifact_dir = f'./Kfold_models/fold{fold}/evaluation'
+            fold_artifact_dir = os.path.join(fold_dir, 'evaluation')
             fold_artifacts = save_evaluation_artifacts(con_mat, class_wise_fold, output_dir=fold_artifact_dir)
             for artifact_path in fold_artifacts:
                 tracker.log_artifact(artifact_path, artifact_path=f'fold{fold}/evaluation')
@@ -405,7 +410,11 @@ def evaluate(config, path, tracker=None):
             'num_valid_folds': num_valid,
         })
 
-        artifact_paths = save_evaluation_artifacts(Confusion_mat, class_wise_result)
+        artifact_paths = save_evaluation_artifacts(
+            Confusion_mat,
+            class_wise_result,
+            output_dir=os.path.join(config.checkpoint_dir, 'evaluation')
+        )
         for artifact_path in artifact_paths:
             tracker.log_artifact(artifact_path, artifact_path='evaluation')
 

@@ -68,6 +68,20 @@ class ConcatLinearFusion(nn.Module):
         return self.fusion(x)
 
 
+class GatedFusion(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.tf_norm = nn.LayerNorm(d_model)
+        self.sse_norm = nn.LayerNorm(d_model)
+        self.gate = nn.Linear(d_model * 2, d_model)
+
+    def forward(self, tf_x, sse_x):
+        tf_norm = self.tf_norm(tf_x)
+        sse_norm = self.sse_norm(sse_x)
+        gate = torch.sigmoid(self.gate(torch.cat([tf_norm, sse_norm], dim=2)))
+        return gate * tf_norm + (1.0 - gate) * sse_norm
+
+
 class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -147,9 +161,21 @@ class Transformer(nn.Module):
         self.sse_encoder_2 = nn.TransformerEncoder(sse_encoder_layer_2, num_layers=config.sse_num_encoder)
         self.sse_encoder_3 = nn.TransformerEncoder(sse_encoder_layer_3, num_layers=config.sse_num_encoder)
 
-        self.fusion_1 = ConcatLinearFusion(config.dim_model, config.dropout)
-        self.fusion_2 = ConcatLinearFusion(config.dim_model, config.dropout)
-        self.fusion_3 = ConcatLinearFusion(config.dim_model, config.dropout)
+        if config.fusion_type == 'gated':
+            fusion_class = GatedFusion
+            fusion_kwargs = {'d_model': config.dim_model}
+        elif config.fusion_type == 'concat_linear':
+            fusion_class = ConcatLinearFusion
+            fusion_kwargs = {'d_model': config.dim_model, 'dropout': config.dropout}
+        else:
+            raise ValueError(
+                f"Unsupported fusion_type {config.fusion_type!r}. "
+                "Expected 'gated' or 'concat_linear'."
+            )
+
+        self.fusion_1 = fusion_class(**fusion_kwargs)
+        self.fusion_2 = fusion_class(**fusion_kwargs)
+        self.fusion_3 = fusion_class(**fusion_kwargs)
 
         self.cross_eeg1_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)
         self.cross_eeg2_eog = CrossAttentionBlock(config.dim_model, config.num_head, config.dropout)

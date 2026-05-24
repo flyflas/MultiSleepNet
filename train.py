@@ -62,6 +62,8 @@ def log_config_params(tracker, config):
         'num_epochs': config.num_epochs,
         'batch_size': config.batch_size,
         'pad_size': config.pad_size,
+        'fusion_type': config.fusion_type,
+        'checkpoint_dir': config.checkpoint_dir,
         'learning_rate': config.learning_rate,
         'dropout': config.dropout,
         'dim_model': config.dim_model,
@@ -139,7 +141,7 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
     if missing_keys:
         raise RuntimeError(
             f'[ERROR] Existing fold {fold} split metadata is missing keys: {missing_keys}. '
-            'Use a separate Kfold_models directory or regenerate folds.'
+            f'Use a separate checkpoint directory ({config.checkpoint_dir}) or regenerate folds.'
         )
 
     checks = {
@@ -170,7 +172,8 @@ def validate_existing_split_metadata(fold_dir, fold, config, train_idx, test_idx
     if failed:
         raise RuntimeError(
             f'[ERROR] Existing fold {fold} split metadata is incompatible with the current split '
-            f'({", ".join(failed)} mismatch). Use a separate Kfold_models directory or regenerate folds.'
+            f'({", ".join(failed)} mismatch). Use a separate checkpoint directory '
+            f'({config.checkpoint_dir}) or regenerate folds.'
         )
 
 
@@ -258,7 +261,7 @@ def has_fold_outputs(fold_dir: str) -> bool:
     )
 
 
-def find_first_unfinished_fold(num_fold: int, root='./Kfold_models') -> int:
+def find_first_unfinished_fold(num_fold: int, root: str) -> int:
     """
     自动找到第一个未完成的 fold。
     如果都完成了，返回 num_fold。
@@ -281,6 +284,8 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] num_epochs = {config.num_epochs}')
     print(f'[INFO] num_fold = {config.num_fold}')
     print(f'[INFO] val_ratio = {config.val_ratio}')
+    print(f'[INFO] fusion_type = {config.fusion_type}')
+    print(f'[INFO] checkpoint_dir = {config.checkpoint_dir}')
     if config.max_folds_to_run is not None:
         print(f'[INFO] max_folds_to_run = {config.max_folds_to_run} (limits newly trained folds only)')
 
@@ -301,7 +306,7 @@ def train(save_all_checkpoint=False, start_fold=None):
     )
 
     # 自动找未完成 fold
-    auto_start_fold = find_first_unfinished_fold(config.num_fold, root='./Kfold_models')
+    auto_start_fold = find_first_unfinished_fold(config.num_fold, root=config.checkpoint_dir)
 
     if start_fold is None:
         start_fold = auto_start_fold
@@ -329,7 +334,7 @@ def train(save_all_checkpoint=False, start_fold=None):
         newly_trained_folds = 0
 
         for fold, (train_idx, test_idx) in enumerate(kf.split(tf_dataset, labels)):
-            fold_dir = f'./Kfold_models/fold{fold}'
+            fold_dir = os.path.join(config.checkpoint_dir, f'fold{fold}')
             os.makedirs(fold_dir, exist_ok=True)
 
             # 1) 小于 start_fold 的一律跳过

@@ -59,6 +59,8 @@ class Config(object):
         self.pad_size = 29
         self.sse_window_size = 200
         self.sse_num_windows = 29
+        self.fusion_type = os.getenv('MCSN_FUSION_TYPE', 'gated').strip()
+        self.checkpoint_dir = os.getenv('MCSN_CHECKPOINT_DIR', './Kfold_models').strip()
         self.learning_rate = 5e-5
 
         # model settings
