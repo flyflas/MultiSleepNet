@@ -149,7 +149,8 @@ def load_split_metadata(fold, fold_dir, config, tf_dataset, sse_dataset, labels)
         'tf_dataset_shape',
         'sse_dataset_shape',
         'labels_shape',
-        'train_test_dataset_shape',
+        'train_test_tf_dataset_shape',
+        'train_test_sse_dataset_shape',
         'train_test_labels_shape',
     }
     missing_keys = sorted(required_keys - set(metadata.files))
