@@ -8,6 +8,13 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
 
 from config import Config
+from compatibility import (
+    DATA_GENERATOR_INTERFACE_VERSION,
+    GROUP_GRANULARITY,
+    MODEL_VARIANT_CONTEXT,
+    MODEL_VARIANT_LEGACY,
+    SPLIT_RANDOM_STATE,
+)
 
 
 TF_METADATA_FILE_NAME = 'tf_per_file_metadata.csv'
@@ -21,10 +28,6 @@ TF_METADATA_FIELDS = [
     'label path',
 ]
 SLEEP_EDF_SUBJECT_RE = re.compile(r'^[A-Za-z]{2}\d{4}')
-CONTEXT_SIZE = 5
-CONTEXT_RADIUS = CONTEXT_SIZE // 2
-GROUP_GRANULARITY = 'subject_id'
-SPLIT_RANDOM_STATE = 0
 
 
 def infer_subject_id_from_sample_id(sample_id):
@@ -69,12 +72,36 @@ def print_label_distribution(labels, split_name='labels'):
         print(f'  class {u}: {c} ({c / total:.6f})')
 
 
-def assert_context_dataset_shape(dataset, labels, split_name='context dataset'):
-    """Fail fast if a context dataset is not shaped as [N, 5, 3, 29, 128]."""
-    expected_tail = (CONTEXT_SIZE, 3, 29, 128)
+def assert_data_generator_contract(config):
+    if config.data_generator_interface_version != DATA_GENERATOR_INTERFACE_VERSION:
+        raise ValueError(
+            '[ERROR] Unsupported data_generator interface version: '
+            f'config={config.data_generator_interface_version}, expected={DATA_GENERATOR_INTERFACE_VERSION}.'
+        )
+    if config.model_variant not in {MODEL_VARIANT_CONTEXT, MODEL_VARIANT_LEGACY}:
+        raise ValueError(f'[ERROR] Unsupported model_variant for data_generator: {config.model_variant!r}')
+
+
+def assert_context_dataset_shape(dataset, labels, config, split_name='context dataset'):
+    """Fail fast if a context dataset is not shaped as [N, C, 3, T, D]."""
+    expected_tail = (config.context_size, 3, config.tf_seq_len, config.dim_model)
     if tuple(dataset.shape[1:]) != expected_tail:
         raise ValueError(
             f'[ERROR] {split_name} has invalid context shape: '
+            f'expected [N, {", ".join(map(str, expected_tail))}], got {tuple(dataset.shape)}'
+        )
+    if len(dataset) != len(labels):
+        raise ValueError(
+            f'[ERROR] {split_name} dataset size ({len(dataset)}) != labels size ({len(labels)})'
+        )
+
+
+def assert_legacy_dataset_shape(dataset, labels, config, split_name='legacy dataset'):
+    """Fail fast if a legacy dataset is not shaped as [N, 3, T, D]."""
+    expected_tail = (3, config.tf_seq_len, config.dim_model)
+    if tuple(dataset.shape[1:]) != expected_tail:
+        raise ValueError(
+            f'[ERROR] {split_name} has invalid legacy shape: '
             f'expected [N, {", ".join(map(str, expected_tail))}], got {tuple(dataset.shape)}'
         )
     if len(dataset) != len(labels):
@@ -136,8 +163,8 @@ def group_train_validation_split(dataset, labels, groups, window_meta, val_ratio
     )
 
 
-def build_context_windows_for_file(path_dataset, row):
-    """Build [E - 4, 5, 3, 29, 128] windows for one PSG file without crossing boundaries."""
+def build_context_windows_for_file(path_dataset, row, config):
+    """Build [N, context_size, 3, tf_seq_len, dim_model] windows without crossing file boundaries."""
     sample_id = row['sample_id']
     subject_id = row['subject_id']
     num_epochs = int(row['num_epochs'])
@@ -150,10 +177,11 @@ def build_context_windows_for_file(path_dataset, row):
     labels = np.load(os.path.join(path_dataset, row['label path'])).astype(np.int64, copy=False)
 
     per_file_dataset = np.stack(channel_arrays, axis=1)
-    if per_file_dataset.shape != (num_epochs, 3, 29, 128):
+    expected_file_shape = (num_epochs, 3, config.tf_seq_len, config.dim_model)
+    if per_file_dataset.shape != expected_file_shape:
         raise ValueError(
             f'[ERROR] {sample_id} stacked TF shape mismatch: '
-            f'expected ({num_epochs}, 3, 29, 128), got {per_file_dataset.shape}'
+            f'expected {expected_file_shape}, got {per_file_dataset.shape}'
         )
     if labels.shape != (num_epochs,):
         raise ValueError(
@@ -161,20 +189,26 @@ def build_context_windows_for_file(path_dataset, row):
             f'expected ({num_epochs},), got {labels.shape}'
         )
 
-    num_windows = max(num_epochs - (CONTEXT_SIZE - 1), 0)
+    num_windows = max(num_epochs - config.left_context - config.right_context, 0)
     if num_windows == 0:
-        empty_windows = np.empty((0, CONTEXT_SIZE, 3, 29, 128), dtype=np.float32)
+        empty_windows = np.empty(
+            (0, config.context_size, 3, config.tf_seq_len, config.dim_model),
+            dtype=np.float32,
+        )
         empty_labels = np.empty((0,), dtype=np.int64)
         return empty_windows, empty_labels, [], np.empty((0,), dtype=object)
 
-    windows = np.empty((num_windows, CONTEXT_SIZE, 3, 29, 128), dtype=np.float32)
+    windows = np.empty(
+        (num_windows, config.context_size, 3, config.tf_seq_len, config.dim_model),
+        dtype=np.float32,
+    )
     window_labels = np.empty((num_windows,), dtype=np.int64)
     window_meta = []
     groups = np.empty((num_windows,), dtype=object)
 
-    for window_index, center_epoch_index in enumerate(range(CONTEXT_RADIUS, num_epochs - CONTEXT_RADIUS)):
-        start = center_epoch_index - CONTEXT_RADIUS
-        end = center_epoch_index + CONTEXT_RADIUS + 1
+    for window_index, center_epoch_index in enumerate(range(config.left_context, num_epochs - config.right_context)):
+        start = center_epoch_index - config.left_context
+        end = center_epoch_index + config.right_context + 1
         windows[window_index] = per_file_dataset[start:end]
         window_label = int(labels[center_epoch_index])
         window_labels[window_index] = window_label
@@ -189,7 +223,7 @@ def build_context_windows_for_file(path_dataset, row):
     for check_index in sorted(set([0, num_windows // 2, num_windows - 1])):
         meta = window_meta[check_index]
         center_epoch_index = int(meta['center_epoch_index'])
-        if not CONTEXT_RADIUS <= center_epoch_index < num_epochs - CONTEXT_RADIUS:
+        if not config.left_context <= center_epoch_index < num_epochs - config.right_context:
             raise ValueError(
                 f'[ERROR] {sample_id} context center out of bounds at window {check_index}: '
                 f'center={center_epoch_index}, num_epochs={num_epochs}'
@@ -207,8 +241,8 @@ def build_context_windows_for_file(path_dataset, row):
         if groups[check_index] != subject_id or meta['sample_id'] != sample_id or meta['subject_id'] != subject_id:
             raise ValueError(f'[ERROR] {sample_id} context metadata identity mismatch at window {check_index}: {meta}')
 
-        start = center_epoch_index - CONTEXT_RADIUS
-        for context_offset in range(CONTEXT_SIZE):
+        start = center_epoch_index - config.left_context
+        for context_offset in range(config.context_size):
             source_epoch_index = start + context_offset
             if not np.array_equal(windows[check_index, context_offset], per_file_dataset[source_epoch_index]):
                 raise ValueError(
@@ -219,7 +253,7 @@ def build_context_windows_for_file(path_dataset, row):
     return windows, window_labels, window_meta, groups
 
 
-def build_context_dataset(path_dataset, metadata_rows):
+def build_context_dataset(path_dataset, metadata_rows, config):
     """Build the dense context dataset plus aligned labels, groups, and metadata."""
     datasets = []
     labels = []
@@ -228,8 +262,8 @@ def build_context_dataset(path_dataset, metadata_rows):
     expected_windows = 0
 
     for row in metadata_rows:
-        expected_windows += max(int(row['num_epochs']) - (CONTEXT_SIZE - 1), 0)
-        file_windows, file_labels, file_meta, file_groups = build_context_windows_for_file(path_dataset, row)
+        expected_windows += max(int(row['num_epochs']) - config.left_context - config.right_context, 0)
+        file_windows, file_labels, file_meta, file_groups = build_context_windows_for_file(path_dataset, row, config)
         if len(file_windows) == 0:
             continue
         datasets.append(file_windows)
@@ -242,7 +276,7 @@ def build_context_dataset(path_dataset, metadata_rows):
         label_array = np.concatenate(labels, axis=0)
         group_array = np.concatenate(groups, axis=0)
     else:
-        dataset = np.empty((0, CONTEXT_SIZE, 3, 29, 128), dtype=np.float32)
+        dataset = np.empty((0, config.context_size, 3, config.tf_seq_len, config.dim_model), dtype=np.float32)
         label_array = np.empty((0,), dtype=np.int64)
         group_array = np.empty((0,), dtype=object)
 
@@ -265,13 +299,86 @@ def build_context_dataset(path_dataset, metadata_rows):
                     f'[ERROR] Context label mismatch at window {check_index}: '
                     f'label={label_array[check_index]}, meta={meta}'
                 )
-            if int(meta['center_epoch_index']) < CONTEXT_RADIUS:
+            if int(meta['center_epoch_index']) < config.left_context:
                 raise ValueError(f'[ERROR] Invalid center epoch metadata at window {check_index}: {meta}')
 
     return dataset, label_array, group_array, window_meta
 
 
-def load_per_file_tf_metadata(path_dataset):
+def build_legacy_epochs_for_file(path_dataset, row, config):
+    """Build [E, 3, tf_seq_len, dim_model] single-epoch samples for the explicit legacy variant."""
+    sample_id = row['sample_id']
+    subject_id = row['subject_id']
+    num_epochs = int(row['num_epochs'])
+    channel_arrays = [
+        np.load(os.path.join(path_dataset, row['EEG Fpz-Cz TF path'])).astype('float32', copy=False),
+        np.load(os.path.join(path_dataset, row['EEG Pz-Oz TF path'])).astype('float32', copy=False),
+        np.load(os.path.join(path_dataset, row['EOG TF path'])).astype('float32', copy=False),
+    ]
+    labels = np.load(os.path.join(path_dataset, row['label path'])).astype(np.int64, copy=False)
+
+    per_file_dataset = np.stack(channel_arrays, axis=1)
+    expected_file_shape = (num_epochs, 3, config.tf_seq_len, config.dim_model)
+    if per_file_dataset.shape != expected_file_shape:
+        raise ValueError(
+            f'[ERROR] {sample_id} legacy TF shape mismatch: '
+            f'expected {expected_file_shape}, got {per_file_dataset.shape}'
+        )
+    if labels.shape != (num_epochs,):
+        raise ValueError(
+            f'[ERROR] {sample_id} legacy label shape mismatch: expected ({num_epochs},), got {labels.shape}'
+        )
+
+    groups = np.asarray([subject_id] * num_epochs, dtype=object)
+    epoch_meta = [
+        {
+            'sample_id': sample_id,
+            'subject_id': subject_id,
+            'epoch_index': int(epoch_index),
+            'label': int(labels[epoch_index]),
+        }
+        for epoch_index in range(num_epochs)
+    ]
+    return per_file_dataset, labels, epoch_meta, groups
+
+
+def build_legacy_dataset(path_dataset, metadata_rows, config):
+    """Build the single-epoch legacy dataset while preserving subject groups."""
+    datasets = []
+    labels = []
+    groups = []
+    epoch_meta = []
+    expected_epochs = 0
+
+    for row in metadata_rows:
+        expected_epochs += int(row['num_epochs'])
+        file_dataset, file_labels, file_meta, file_groups = build_legacy_epochs_for_file(path_dataset, row, config)
+        datasets.append(file_dataset)
+        labels.append(file_labels)
+        groups.append(file_groups)
+        epoch_meta.extend(file_meta)
+
+    if datasets:
+        dataset = np.concatenate(datasets, axis=0)
+        label_array = np.concatenate(labels, axis=0)
+        group_array = np.concatenate(groups, axis=0)
+    else:
+        dataset = np.empty((0, 3, config.tf_seq_len, config.dim_model), dtype=np.float32)
+        label_array = np.empty((0,), dtype=np.int64)
+        group_array = np.empty((0,), dtype=object)
+
+    if len(dataset) != expected_epochs:
+        raise ValueError(f'[ERROR] Legacy dataset length mismatch: expected {expected_epochs}, got {len(dataset)}')
+    if len(epoch_meta) != len(dataset) or len(group_array) != len(dataset):
+        raise ValueError(
+            '[ERROR] Legacy metadata/groups are not aligned with single-epoch samples: '
+            f'epochs={len(dataset)}, meta={len(epoch_meta)}, groups={len(group_array)}'
+        )
+
+    return dataset, label_array, group_array, epoch_meta
+
+
+def load_per_file_tf_metadata(path_dataset, config):
     """Load and validate per-file TF metadata generated by preprocess_tf.py."""
     metadata_path = os.path.join(path_dataset, TF_METADATA_FILE_NAME)
     if not os.path.exists(metadata_path):
@@ -336,7 +443,7 @@ def load_per_file_tf_metadata(path_dataset):
         ]
         label_shape = np.load(os.path.join(path_dataset, label_path), mmap_mode='r').shape
 
-        expected_tf_shape = (num_epochs, 29, 128)
+        expected_tf_shape = (num_epochs, config.tf_seq_len, config.dim_model)
         if any(shape != expected_tf_shape for shape in channel_shapes):
             raise ValueError(
                 f'[ERROR] {sample_id} channel shape mismatch: '
@@ -358,58 +465,87 @@ def load_per_file_tf_metadata(path_dataset):
     return rows
 
 
-def data_generator(path_labels, path_dataset):
-    config = Config()
+def build_validation_loader(X_val, y_val, config):
+    val_set = TensorDataset(X_val, y_val)
+    num_workers = int(config.num_workers)
+    return DataLoader(
+        dataset=val_set,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+
+def data_generator(path_labels, path_dataset, config=None):
+    config = config or Config()
+    assert_data_generator_contract(config)
 
     if path_labels is not None:
-        print('[INFO] path_labels is unused for context windows; labels are loaded from per-file metadata.')
+        print('[INFO] path_labels is unused; labels are loaded from per-file TF metadata.')
 
-    metadata_rows = load_per_file_tf_metadata(path_dataset)
-    dataset_np, labels_np, groups, window_meta = build_context_dataset(path_dataset, metadata_rows)
+    metadata_rows = load_per_file_tf_metadata(path_dataset, config)
+    if config.model_variant == MODEL_VARIANT_CONTEXT:
+        dataset_np, labels_np, groups, sample_meta = build_context_dataset(path_dataset, metadata_rows, config)
+        split_name = 'context'
+    elif config.model_variant == MODEL_VARIANT_LEGACY:
+        dataset_np, labels_np, groups, sample_meta = build_legacy_dataset(path_dataset, metadata_rows, config)
+        split_name = 'legacy'
+    else:
+        raise ValueError(f'[ERROR] Unsupported model_variant: {config.model_variant!r}')
 
     dataset = torch.from_numpy(dataset_np)
     labels = torch.from_numpy(labels_np)
-    assert_context_dataset_shape(dataset, labels, split_name='full context dataset')
+    if config.model_variant == MODEL_VARIANT_CONTEXT:
+        assert_context_dataset_shape(dataset, labels, config, split_name='full context dataset')
+    else:
+        assert_legacy_dataset_shape(dataset, labels, config, split_name='full legacy dataset')
 
-    print(f'[INFO] context dataset shape: {dataset.shape}')
-    print(f'[INFO] context labels shape: {labels.shape}')
-    print(f'[INFO] context groups shape: {groups.shape}')
-    print(f'[INFO] context window metadata rows: {len(window_meta)}')
-    print(f'[INFO] expected context windows: {sum(max(int(row["num_epochs"]) - 4, 0) for row in metadata_rows)}')
+    print(f'[INFO] data_generator_interface_version: {config.data_generator_interface_version}')
+    print(f'[INFO] model_variant: {config.model_variant}')
+    print(f'[INFO] {split_name} dataset shape: {dataset.shape}')
+    print(f'[INFO] {split_name} labels shape: {labels.shape}')
+    print(f'[INFO] {split_name} groups shape: {groups.shape}')
+    print(f'[INFO] {split_name} metadata rows: {len(sample_meta)}')
+    if config.model_variant == MODEL_VARIANT_CONTEXT:
+        expected_context_windows = sum(
+            max(int(row['num_epochs']) - config.left_context - config.right_context, 0)
+            for row in metadata_rows
+        )
+        print(f'[INFO] expected context windows: {expected_context_windows}')
 
-    print_label_distribution(labels, split_name='full context dataset')
+    print_label_distribution(labels, split_name=f'full {split_name} dataset')
 
-    X_train_test, X_val, y_train_test, y_val, groups_train_test, groups_val, meta_train_test, meta_val = group_train_validation_split(
+    X_train_test, X_val, y_train_test, y_val, groups_train_test, groups_val, meta_train_test, meta_val = (
+        group_train_validation_split(
         dataset,
         labels,
         groups,
-        window_meta,
+        sample_meta,
         val_ratio=config.val_ratio,
+        )
     )
 
-    assert_context_dataset_shape(X_train_test, y_train_test, split_name='train_test context dataset')
-    assert_context_dataset_shape(X_val, y_val, split_name='val context dataset')
+    if config.model_variant == MODEL_VARIANT_CONTEXT:
+        assert_context_dataset_shape(X_train_test, y_train_test, config, split_name='train_test context dataset')
+        assert_context_dataset_shape(X_val, y_val, config, split_name='val context dataset')
+    else:
+        assert_legacy_dataset_shape(X_train_test, y_train_test, config, split_name='train_test legacy dataset')
+        assert_legacy_dataset_shape(X_val, y_val, config, split_name='val legacy dataset')
 
-    print(f'[INFO] train_test context size: {len(X_train_test)}')
-    print(f'[INFO] val context size: {len(X_val)}')
+    print(f'[INFO] train_test {split_name} size: {len(X_train_test)}')
+    print(f'[INFO] val {split_name} size: {len(X_val)}')
     print(f'[INFO] train_test unique groups: {len(set(groups_train_test))}')
     print(f'[INFO] val unique groups: {len(set(groups_val))}')
     print(f'[INFO] group granularity: {GROUP_GRANULARITY}')
     print('[INFO] held-out validation split is group-aware and uses disjoint subject_id groups.')
 
-    print_label_distribution(y_train_test, split_name='train_test context')
-    print_label_distribution(y_val, split_name='val context')
+    print_label_distribution(y_train_test, split_name=f'train_test {split_name}')
+    print_label_distribution(y_val, split_name=f'val {split_name}')
 
-    val_set = TensorDataset(X_val, y_val)
-    val_loader = DataLoader(
-        dataset=val_set,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=12,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
+    val_loader = build_validation_loader(X_val, y_val, config)
 
     return X_train_test, y_train_test, groups_train_test, meta_train_test, val_loader, meta_val
 

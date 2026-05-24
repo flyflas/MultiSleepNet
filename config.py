@@ -42,6 +42,11 @@ def _get_float_env(name, default):
         raise ValueError(f'{name} must be a float, got {value!r}') from exc
 
 
+def _get_str_env(name, default):
+    value = os.getenv(name, '').strip()
+    return value if value else default
+
+
 class Config(object):
     """args in model and trainer"""
     def __init__(self):
@@ -59,13 +64,26 @@ class Config(object):
         self.pad_size = 29
         self.learning_rate = 5e-5
 
+        # compatibility / artifact routing
+        self.model_variant = _get_str_env('MCSN_MODEL_VARIANT', 'context')
+        if self.model_variant not in {'context', 'legacy'}:
+            raise ValueError(f'MCSN_MODEL_VARIANT must be "context" or "legacy", got {self.model_variant!r}')
+        self.checkpoint_root = _get_str_env('MCSN_CHECKPOINT_ROOT', './Kfold_models')
+        self.variant_checkpoint_root = os.path.join(self.checkpoint_root, self.model_variant)
+        self.normalization_strategy = _get_str_env('MCSN_NORMALIZATION_STRATEGY', 'global_channel_mean_std')
+        self.data_generator_interface_version = _get_int_env('MCSN_DATA_GENERATOR_INTERFACE_VERSION', 2)
+        self.fusion_boundary_shape = _get_str_env('MCSN_FUSION_BOUNDARY_SHAPE', 'sequence_tf_tokens')
+
         # model settings
         self.dropout = 0.1
         self.dim_model = 128
         self.tf_seq_len = _get_int_env('MCSN_TF_SEQ_LEN', self.pad_size)
-        self.context_size = _get_int_env('MCSN_CONTEXT_SIZE', 5)
-        self.left_context = _get_int_env('MCSN_LEFT_CONTEXT', 2)
-        self.right_context = _get_int_env('MCSN_RIGHT_CONTEXT', 2)
+        default_context_size = 1 if self.model_variant == 'legacy' else 5
+        default_left_context = 0 if self.model_variant == 'legacy' else 2
+        default_right_context = 0 if self.model_variant == 'legacy' else 2
+        self.context_size = _get_int_env('MCSN_CONTEXT_SIZE', default_context_size)
+        self.left_context = _get_int_env('MCSN_LEFT_CONTEXT', default_left_context)
+        self.right_context = _get_int_env('MCSN_RIGHT_CONTEXT', default_right_context)
         if self.tf_seq_len <= 0:
             raise ValueError(f'MCSN_TF_SEQ_LEN must be positive, got {self.tf_seq_len}')
         if self.context_size <= 0:
@@ -78,6 +96,13 @@ class Config(object):
             raise ValueError(
                 'MCSN_CONTEXT_SIZE must equal MCSN_LEFT_CONTEXT + 1 + MCSN_RIGHT_CONTEXT, '
                 f'got {self.context_size} != {self.left_context} + 1 + {self.right_context}'
+            )
+        if self.model_variant == 'legacy' and (
+            self.context_size != 1 or self.left_context != 0 or self.right_context != 0
+        ):
+            raise ValueError(
+                'MCSN_MODEL_VARIANT=legacy requires single-epoch context settings: '
+                'MCSN_CONTEXT_SIZE=1, MCSN_LEFT_CONTEXT=0, MCSN_RIGHT_CONTEXT=0.'
             )
         self.forward_hidden = 1024
         self.fc_hidden = 1024

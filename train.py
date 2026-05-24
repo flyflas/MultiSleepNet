@@ -16,12 +16,21 @@ from early_stopping import EarlyStopping
 from data_loader import data_generator
 from config import Config, Path
 from mlflow_utils import MLflowTracker
-
-
-SPLIT_METADATA_FILE = 'split_metadata.npz'
-SPLIT_RANDOM_STATE = 0
-SPLIT_SHUFFLE = True
-GROUP_GRANULARITY = 'subject_id'
+from compatibility import (
+    CHECKPOINT_METADATA_FILE,
+    GROUP_GRANULARITY,
+    SPLIT_METADATA_FILE,
+    SPLIT_RANDOM_STATE,
+    SPLIT_SHUFFLE,
+    assert_checkpoint_compatibility,
+    assert_metadata_compatibility,
+    assert_runtime_compatibility,
+    checkpoint_metadata_path,
+    checkpoint_root,
+    current_compatibility_metadata,
+    fold_dir as get_fold_dir,
+    save_checkpoint_metadata,
+)
 
 
 def set_random_seed(seed=0):
@@ -76,6 +85,11 @@ def log_config_params(tracker, config):
         'num_encoder': config.num_encoder,
         'num_encoder_context': config.num_encoder_context,
         'num_encoder_multi': config.num_encoder_multi,
+        'model_variant': config.model_variant,
+        'checkpoint_root': checkpoint_root(config),
+        'normalization_strategy': config.normalization_strategy,
+        'data_generator_interface_version': config.data_generator_interface_version,
+        'fusion_boundary_shape': config.fusion_boundary_shape,
         'use_positional_encoding': config.use_positional_encoding,
         'mamba_d_state': config.mamba_d_state,
         'mamba_d_conv': config.mamba_d_conv,
@@ -99,7 +113,10 @@ def split_window_identity(window_meta, indices):
     selected = [window_meta[int(index)] for index in indices]
     sample_ids = np.asarray([meta['sample_id'] for meta in selected], dtype=str)
     subject_ids = np.asarray([meta['subject_id'] for meta in selected], dtype=str)
-    center_epoch_indices = np.asarray([int(meta['center_epoch_index']) for meta in selected], dtype=np.int64)
+    center_epoch_indices = np.asarray(
+        [int(meta.get('center_epoch_index', meta.get('epoch_index'))) for meta in selected],
+        dtype=np.int64,
+    )
     labels = np.asarray([int(meta['label']) for meta in selected], dtype=np.int64)
     return sample_ids, subject_ids, center_epoch_indices, labels
 
@@ -150,6 +167,12 @@ def assert_group_split_integrity(train_idx, test_idx, groups, val_window_meta=No
 
 
 def assert_model_supports_dataset_shape(dataset, config):
+    expected_variant = 'context' if dataset.dim() == 5 else 'legacy' if dataset.dim() == 4 else 'unsupported'
+    if config.model_variant != expected_variant:
+        raise RuntimeError(
+            f'[ERROR] Config model_variant={config.model_variant!r} does not match training dataset rank '
+            f'{dataset.dim()} (expected {expected_variant!r}).'
+        )
     if dataset.dim() == 5:
         expected_tail = (config.context_size, 3, config.tf_seq_len, config.dim_model)
     elif dataset.dim() == 4:
@@ -202,6 +225,7 @@ def save_split_metadata(
         'train_test_dataset_shape': np.asarray(dataset.shape, dtype=np.int64),
         'train_test_labels_shape': np.asarray(labels.shape, dtype=np.int64),
     }
+    metadata.update(current_compatibility_metadata(config, dataset))
 
     if groups is not None:
         groups = np.asarray(groups)
@@ -212,6 +236,9 @@ def save_split_metadata(
             'train_group_ids': train_group_ids,
             'test_group_ids': test_group_ids,
             'validation_group_ids': validation_group_ids,
+            'group_ids_train': train_group_ids,
+            'group_ids_test': test_group_ids,
+            'group_ids_val': validation_group_ids,
             'group_granularity': np.array(GROUP_GRANULARITY),
             'group_split_enforced': np.array(True, dtype=np.bool_),
         })
@@ -288,6 +315,9 @@ def validate_existing_split_metadata(
             'validation_group_ids',
             'group_granularity',
             'group_split_enforced',
+            'group_ids_train',
+            'group_ids_test',
+            'group_ids_val',
         })
     if dataset.dim() == 5:
         if window_meta is None:
@@ -313,6 +343,7 @@ def validate_existing_split_metadata(
             f'[ERROR] Existing fold {fold} split metadata is missing keys: {missing_keys}. '
             'Use a separate Kfold_models directory or regenerate folds.'
         )
+    assert_metadata_compatibility(metadata, config, dataset, fold, 'split')
 
     checks = {
         'fold_index': int(metadata['fold_index']) == fold,
@@ -358,6 +389,9 @@ def validate_existing_split_metadata(
                 metadata['validation_group_ids'].astype(str),
                 validation_group_ids,
             ),
+            'group_ids_train': np.array_equal(metadata['group_ids_train'].astype(str), train_group_ids),
+            'group_ids_test': np.array_equal(metadata['group_ids_test'].astype(str), test_group_ids),
+            'group_ids_val': np.array_equal(metadata['group_ids_val'].astype(str), validation_group_ids),
             'group_granularity': str(np.asarray(metadata['group_granularity']).item()) == GROUP_GRANULARITY,
             'group_split_enforced': bool(metadata['group_split_enforced']) is True,
         })
@@ -395,6 +429,25 @@ def validate_existing_split_metadata(
             f'[ERROR] Existing fold {fold} split metadata is incompatible with the current split '
             f'({", ".join(failed)} mismatch). Use a separate Kfold_models directory or regenerate folds.'
         )
+
+
+def validate_existing_checkpoint_metadata(fold_dir, fold, config, dataset):
+    split_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
+    checkpoint_path = checkpoint_metadata_path(config, fold)
+    if not os.path.exists(checkpoint_path):
+        raise RuntimeError(
+            f'[ERROR] Existing fold {fold} is missing {CHECKPOINT_METADATA_FILE}. '
+            'Refusing to treat legacy or unversioned checkpoint artifacts as compatible.'
+        )
+    if not os.path.exists(split_path):
+        raise RuntimeError(
+            f'[ERROR] Existing fold {fold} is missing {SPLIT_METADATA_FILE}. '
+            'Checkpoint compatibility cannot be validated without split metadata.'
+        )
+
+    split_metadata = np.load(split_path)
+    checkpoint_metadata = np.load(checkpoint_path)
+    assert_checkpoint_compatibility(checkpoint_metadata, split_metadata, config, dataset, fold)
 
 
 def build_dataloader(dataset, batch_size, shuffle, num_workers=8):
@@ -467,6 +520,7 @@ def is_fold_finished(fold_dir: str) -> bool:
         'val_ACC.npy',
         'model.pkl',
         SPLIT_METADATA_FILE,
+        CHECKPOINT_METADATA_FILE,
     ]
     return all(os.path.exists(os.path.join(fold_dir, f)) for f in required_files)
 
@@ -475,7 +529,20 @@ def has_fold_outputs(fold_dir: str) -> bool:
     if not os.path.isdir(fold_dir):
         return False
     return any(
-        name.endswith(('.pkl', '.npy')) or name == SPLIT_METADATA_FILE
+        name.endswith(('.pkl', '.npy', '.npz'))
+        for name in os.listdir(fold_dir)
+    )
+
+
+def has_checkpoint_artifacts(fold_dir: str) -> bool:
+    if not os.path.isdir(fold_dir):
+        return False
+    return any(
+        (
+            name == CHECKPOINT_METADATA_FILE
+            or name.endswith('.pkl')
+            or name.endswith('.npy')
+        )
         for name in os.listdir(fold_dir)
     )
 
@@ -503,12 +570,18 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] num_epochs = {config.num_epochs}')
     print(f'[INFO] num_fold = {config.num_fold}')
     print(f'[INFO] val_ratio = {config.val_ratio}')
+    print(f'[INFO] model_variant = {config.model_variant}')
+    print(f'[INFO] checkpoint_root = {checkpoint_root(config)}')
+    print(f'[INFO] normalization_strategy = {config.normalization_strategy}')
+    print(f'[INFO] data_generator_interface_version = {config.data_generator_interface_version}')
+    print(f'[INFO] fusion_boundary_shape = {config.fusion_boundary_shape}')
     if config.max_folds_to_run is not None:
         print(f'[INFO] max_folds_to_run = {config.max_folds_to_run} (limits newly trained folds only)')
 
     dataset, labels, groups, window_meta, val_loader, val_window_meta = data_generator(
         path_labels=path.path_labels,
-        path_dataset=path.path_TF
+        path_dataset=path.path_TF,
+        config=config,
     )
 
     print(f'[INFO] dataset shape: {dataset.shape}')
@@ -518,6 +591,7 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] val window metadata rows: {len(val_window_meta)}')
     print_label_distribution(labels, split_name='full dataset')
     assert_model_supports_dataset_shape(dataset, config)
+    assert_runtime_compatibility(config, dataset)
 
     kf = StratifiedGroupKFold(
         n_splits=config.num_fold,
@@ -526,7 +600,8 @@ def train(save_all_checkpoint=False, start_fold=None):
     )
 
     # 自动找未完成 fold
-    auto_start_fold = find_first_unfinished_fold(config.num_fold, root='./Kfold_models')
+    root = checkpoint_root(config)
+    auto_start_fold = find_first_unfinished_fold(config.num_fold, root=root)
 
     if start_fold is None:
         start_fold = auto_start_fold
@@ -553,6 +628,13 @@ def train(save_all_checkpoint=False, start_fold=None):
             'right_context': config.right_context,
             'group_granularity': GROUP_GRANULARITY,
             'group_split_enforced': True,
+            'model_variant': config.model_variant,
+            'checkpoint_root': root,
+            'normalization_strategy': config.normalization_strategy,
+            'data_generator_interface_version': config.data_generator_interface_version,
+            'tf_seq_len': config.tf_seq_len,
+            'fusion_boundary_shape': config.fusion_boundary_shape,
+            'fusion_boundary_output_shape': tuple((config.tf_seq_len, config.dim_model)),
         })
         tracker.log_params({f'full_distribution_{k}': v for k, v in label_distribution(labels).items()})
 
@@ -564,7 +646,7 @@ def train(save_all_checkpoint=False, start_fold=None):
         split_groups = np.asarray(groups, dtype=str)
 
         for fold, (train_idx, test_idx) in enumerate(kf.split(split_input, split_labels, split_groups)):
-            fold_dir = f'./Kfold_models/fold{fold}'
+            fold_dir = get_fold_dir(config, fold)
             os.makedirs(fold_dir, exist_ok=True)
 
             # 1) 小于 start_fold 的一律跳过
@@ -582,6 +664,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                         window_meta,
                         val_window_meta,
                     )
+                    validate_existing_checkpoint_metadata(fold_dir, fold, config, dataset)
                 print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
                 continue
 
@@ -599,6 +682,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                     window_meta,
                     val_window_meta,
                 )
+                validate_existing_checkpoint_metadata(fold_dir, fold, config, dataset)
                 print(f'[INFO] Skip fold {fold} (already finished).')
                 continue
 
@@ -616,6 +700,13 @@ def train(save_all_checkpoint=False, start_fold=None):
                     window_meta,
                     val_window_meta,
                 )
+                if os.path.exists(os.path.join(fold_dir, CHECKPOINT_METADATA_FILE)):
+                    validate_existing_checkpoint_metadata(fold_dir, fold, config, dataset)
+                elif has_checkpoint_artifacts(fold_dir):
+                    raise RuntimeError(
+                        f'[ERROR] Fold {fold} has existing checkpoint artifacts but no {CHECKPOINT_METADATA_FILE}. '
+                        'Refusing to continue because legacy or unversioned checkpoints cannot be validated.'
+                    )
             elif has_fold_outputs(fold_dir):
                 raise RuntimeError(
                     f'[ERROR] Fold {fold} has existing outputs but no {SPLIT_METADATA_FILE}. '
@@ -657,6 +748,14 @@ def train(save_all_checkpoint=False, start_fold=None):
                 window_meta,
                 val_window_meta,
             )
+            checkpoint_metadata_path = save_checkpoint_metadata(
+                config,
+                dataset,
+                fold,
+                train_group_ids,
+                test_group_ids,
+                validation_group_ids,
+            )
 
             print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
             print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
@@ -679,6 +778,8 @@ def train(save_all_checkpoint=False, start_fold=None):
                     'y_train_shape': tuple(y_train.shape),
                     'x_test_shape': tuple(X_test.shape),
                     'y_test_shape': tuple(y_test.shape),
+                    'checkpoint_metadata_path': checkpoint_metadata_path,
+                    'model_variant': config.model_variant,
                 })
                 tracker.log_params({f'train_distribution_{k}': v for k, v in label_distribution(y_train).items()})
                 tracker.log_params({f'test_distribution_{k}': v for k, v in label_distribution(y_test).items()})

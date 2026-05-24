@@ -18,13 +18,24 @@ from model import Transformer
 from data_loader import data_generator
 from config import Config, Path
 from mlflow_utils import MLflowTracker
+from compatibility import (
+    CHECKPOINT_METADATA_FILE,
+    GROUP_GRANULARITY,
+    SPLIT_METADATA_FILE,
+    SPLIT_RANDOM_STATE,
+    SPLIT_SHUFFLE,
+    assert_checkpoint_compatibility,
+    assert_metadata_compatibility,
+    assert_runtime_compatibility,
+    checkpoint_metadata_path,
+    checkpoint_root,
+    evaluation_dir,
+    fold_dir as get_fold_dir,
+    model_path as get_model_path,
+)
 
 
 CLASS_NAMES = ['Wake', 'N1', 'N2', 'N3', 'REM']
-SPLIT_METADATA_FILE = 'split_metadata.npz'
-SPLIT_RANDOM_STATE = 0
-SPLIT_SHUFFLE = True
-GROUP_GRANULARITY = 'subject_id'
 
 
 def specificity(y_true, y_pred, n=5):
@@ -88,7 +99,7 @@ def print_class_wise_result(class_wise_result, class_names=CLASS_NAMES):
         print(f'{name:<8} {precision:>10.4f} {recall:>10.4f} {f1:>10.4f} {spec:>10.4f} {int(support):>10}')
 
 
-def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir='./Kfold_models/evaluation'):
+def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     confusion_path = os.path.join(output_dir, 'confusion_matrix.npy')
@@ -134,7 +145,10 @@ def split_window_identity(window_meta, indices):
     selected = [window_meta[int(index)] for index in indices]
     sample_ids = np.asarray([meta['sample_id'] for meta in selected], dtype=str)
     subject_ids = np.asarray([meta['subject_id'] for meta in selected], dtype=str)
-    center_epoch_indices = np.asarray([int(meta['center_epoch_index']) for meta in selected], dtype=np.int64)
+    center_epoch_indices = np.asarray(
+        [int(meta.get('center_epoch_index', meta.get('epoch_index'))) for meta in selected],
+        dtype=np.int64,
+    )
     labels = np.asarray([int(meta['label']) for meta in selected], dtype=np.int64)
     return sample_ids, subject_ids, center_epoch_indices, labels
 
@@ -185,6 +199,12 @@ def assert_group_split_integrity(train_idx, test_idx, groups, val_window_meta=No
 
 
 def assert_model_supports_dataset_shape(dataset, config):
+    expected_variant = 'context' if dataset.dim() == 5 else 'legacy' if dataset.dim() == 4 else 'unsupported'
+    if config.model_variant != expected_variant:
+        raise RuntimeError(
+            f'[ERROR] Config model_variant={config.model_variant!r} does not match evaluation dataset rank '
+            f'{dataset.dim()} (expected {expected_variant!r}).'
+        )
     if dataset.dim() == 5:
         expected_tail = (config.context_size, 3, config.tf_seq_len, config.dim_model)
     elif dataset.dim() == 4:
@@ -232,6 +252,9 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
             'validation_group_ids',
             'group_granularity',
             'group_split_enforced',
+            'group_ids_train',
+            'group_ids_test',
+            'group_ids_val',
         })
     if dataset.dim() == 5:
         if window_meta is None:
@@ -252,6 +275,7 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
     missing_keys = sorted(required_keys - set(metadata.files))
     if missing_keys:
         raise RuntimeError(f'[ERROR] fold {fold} split metadata is missing keys: {missing_keys}')
+    assert_metadata_compatibility(metadata, config, dataset, fold, 'split')
 
     metadata_fold = int(metadata['fold_index'])
     metadata_num_fold = int(metadata['num_fold'])
@@ -325,6 +349,12 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
             raise RuntimeError(f'[ERROR] fold {fold} test group IDs mismatch in split metadata.')
         if not np.array_equal(metadata['validation_group_ids'].astype(str), validation_group_ids):
             raise RuntimeError(f'[ERROR] fold {fold} validation group IDs mismatch in split metadata.')
+        if not np.array_equal(metadata['group_ids_train'].astype(str), train_group_ids):
+            raise RuntimeError(f'[ERROR] fold {fold} train group IDs compatibility field mismatch.')
+        if not np.array_equal(metadata['group_ids_test'].astype(str), test_group_ids):
+            raise RuntimeError(f'[ERROR] fold {fold} test group IDs compatibility field mismatch.')
+        if not np.array_equal(metadata['group_ids_val'].astype(str), validation_group_ids):
+            raise RuntimeError(f'[ERROR] fold {fold} validation group IDs compatibility field mismatch.')
         if str(np.asarray(metadata['group_granularity']).item()) != GROUP_GRANULARITY:
             raise RuntimeError(f'[ERROR] fold {fold} group granularity mismatch in split metadata.')
         if bool(metadata['group_split_enforced']) is not True:
@@ -363,6 +393,15 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
             raise RuntimeError(
                 f'[ERROR] fold {fold} context split identity mismatch: {", ".join(failed_context_checks)}.'
             )
+
+    checkpoint_path = checkpoint_metadata_path(config, fold)
+    if not os.path.exists(checkpoint_path):
+        raise RuntimeError(
+            f'[ERROR] fold {fold} is missing {CHECKPOINT_METADATA_FILE}. '
+            'Refusing to evaluate legacy or unversioned checkpoint artifacts.'
+        )
+    checkpoint_metadata = np.load(checkpoint_path)
+    assert_checkpoint_compatibility(checkpoint_metadata, metadata, config, dataset, fold)
 
     return test_idx
 
@@ -414,7 +453,7 @@ def test(model, test_loader, config):
 
 
 def evaluate_single_fold(config, dataset, labels, fold, test_idx):
-    path_model = f'./Kfold_models/fold{fold}/model.pkl'
+    path_model = get_model_path(config, fold)
     if not os.path.exists(path_model):
         raise FileNotFoundError(f'Model not found: {path_model}')
 
@@ -446,10 +485,12 @@ def evaluate(config, path, tracker=None):
 
     dataset, labels, groups, window_meta, _, val_window_meta = data_generator(
         path_labels=path.path_labels,
-        path_dataset=path.path_TF
+        path_dataset=path.path_TF,
+        config=config,
     )
 
     assert_model_supports_dataset_shape(dataset, config)
+    assert_runtime_compatibility(config, dataset)
 
     with tracker.start_run(run_name=config.mlflow_run_name or 'evaluate') as _:
         tracker.log_params({
@@ -470,6 +511,12 @@ def evaluate(config, path, tracker=None):
             'val_window_meta_rows': len(val_window_meta),
             'dataset_size': len(labels),
             'device': config.device,
+            'model_variant': config.model_variant,
+            'checkpoint_root': checkpoint_root(config),
+            'normalization_strategy': config.normalization_strategy,
+            'data_generator_interface_version': config.data_generator_interface_version,
+            'fusion_boundary_shape': config.fusion_boundary_shape,
+            'fusion_boundary_output_shape': tuple((config.tf_seq_len, config.dim_model)),
         })
 
         ACC = 0.0
@@ -483,7 +530,7 @@ def evaluate(config, path, tracker=None):
 
         valid_folds = []
 
-        trained_folds = find_trained_fold_dirs()
+        trained_folds = find_trained_fold_dirs(root=checkpoint_root(config))
         if len(trained_folds) == 0:
             raise RuntimeError('[ERROR] No trained fold models found.')
 
@@ -523,7 +570,7 @@ def evaluate(config, path, tracker=None):
                 f'fold_{fold}_balanced_accuracy': balanced_acc,
             })
 
-            fold_artifact_dir = f'./Kfold_models/fold{fold}/evaluation'
+            fold_artifact_dir = os.path.join(get_fold_dir(config, fold), 'evaluation')
             fold_artifacts = save_evaluation_artifacts(con_mat, class_wise_fold, output_dir=fold_artifact_dir)
             for artifact_path in fold_artifacts:
                 tracker.log_artifact(artifact_path, artifact_path=f'fold{fold}/evaluation')
@@ -564,7 +611,11 @@ def evaluate(config, path, tracker=None):
             'num_valid_folds': num_valid,
         })
 
-        artifact_paths = save_evaluation_artifacts(Confusion_mat, class_wise_result)
+        artifact_paths = save_evaluation_artifacts(
+            Confusion_mat,
+            class_wise_result,
+            output_dir=evaluation_dir(config),
+        )
         for artifact_path in artifact_paths:
             tracker.log_artifact(artifact_path, artifact_path='evaluation')
 
