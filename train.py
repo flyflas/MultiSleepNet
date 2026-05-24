@@ -16,6 +16,11 @@ from early_stopping import EarlyStopping
 from data_loader import data_generator
 from config import Config, Path
 from mlflow_utils import MLflowTracker
+from experiment_reporting import (
+    build_experiment_metadata,
+    count_model_parameters,
+    write_experiment_report,
+)
 from compatibility import (
     CHECKPOINT_METADATA_FILE,
     GROUP_GRANULARITY,
@@ -105,7 +110,7 @@ def log_config_params(tracker, config):
 
 def log_fold_artifacts(tracker, fold_dir):
     for filename in os.listdir(fold_dir):
-        if filename.endswith(('.pkl', '.npy', '.npz')):
+        if filename.endswith(('.pkl', '.npy', '.npz', '.json', '.txt', '.csv')):
             tracker.log_artifact(os.path.join(fold_dir, filename), artifact_path=os.path.basename(fold_dir))
 
 
@@ -801,6 +806,8 @@ def train(save_all_checkpoint=False, start_fold=None):
                 )
 
                 model = Transformer(config).to(config.device)
+                model_parameter_count = count_model_parameters(model)
+                tracker.log_params({'model_parameter_count': model_parameter_count})
                 criterion = nn.CrossEntropyLoss()
 
                 optimizer = optim.AdamW(
@@ -935,6 +942,34 @@ def train(save_all_checkpoint=False, start_fold=None):
                     'final_test_loss': test_LOSS[-1] if test_LOSS else 0.0,
                     'final_test_acc': test_ACC[-1] if test_ACC else 0.0,
                 })
+                report_metadata = build_experiment_metadata(
+                    config,
+                    dataset,
+                    stage='train',
+                    model_parameter_count=model_parameter_count,
+                    fold=fold,
+                    metrics={
+                        'best_val_acc': best_val_acc,
+                        'best_epoch': best_epoch,
+                        'stopped_epoch': stopped_epoch if stopped_epoch is not None else -1,
+                        'early_stopped': bool(early_stopped),
+                        'final_train_loss': train_LOSS[-1] if train_LOSS else 0.0,
+                        'final_train_acc': train_ACC[-1] if train_ACC else 0.0,
+                        'final_val_loss': val_LOSS[-1] if val_LOSS else 0.0,
+                        'final_val_acc': val_ACC[-1] if val_ACC else 0.0,
+                        'final_test_loss': test_LOSS[-1] if test_LOSS else 0.0,
+                        'final_test_acc': test_ACC[-1] if test_ACC else 0.0,
+                    },
+                    sizes={
+                        'train_size': len(train_idx),
+                        'test_size': len(test_idx),
+                        'val_size': len(val_loader.dataset) if hasattr(val_loader, 'dataset') else None,
+                        'train_group_count': len(train_group_ids),
+                        'test_group_count': len(test_group_ids),
+                        'validation_group_count': len(validation_group_ids),
+                    },
+                )
+                write_experiment_report(fold_dir, report_metadata, prefix='training_report')
                 log_fold_artifacts(tracker, fold_dir)
 
                 del model

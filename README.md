@@ -69,6 +69,28 @@ Kfold_models/context/fold0/model.pkl
 Kfold_models/legacy/fold0/model.pkl
 ```
 
+## Evaluation Reports
+
+Training and evaluation write human-readable experiment metadata next to the numeric artifacts so context metrics are not confused with the legacy baseline.
+
+Context outputs are under `Kfold_models/context/...` and reports identify the model as `context_t-2..t+2_subject_split`. The report files explicitly state `context_window: t-2..t+2`, `uses_future_epochs: true`, `future_epochs_used: [t+1, t+2]`, `split_level: subject-level`, `split_granularity: subject_id`, the normalization strategy, batch size, input shape, and model parameter count.
+
+Legacy outputs are under `Kfold_models/legacy/...` and reports identify the model as `legacy_single_epoch_subject_split`. These reports explicitly mark `single_epoch_baseline: true`, `context_window: t`, and `uses_future_epochs: false`.
+
+Generated report files include:
+
+```text
+Kfold_models/context/fold0/training_report.json
+Kfold_models/context/fold0/training_report.txt
+Kfold_models/context/fold0/evaluation/evaluation_report.json
+Kfold_models/context/fold0/evaluation/evaluation_report.txt
+Kfold_models/context/evaluation/evaluation_summary.json
+Kfold_models/context/evaluation/evaluation_summary.txt
+Kfold_models/context/evaluation/metrics_summary.csv
+```
+
+All current splits are group-aware subject-level splits using `subject_id`. They are not PSG-file-level splits and not legacy epoch-level random splits; the report files include this warning beside the metrics.
+
 Each fold writes `split_metadata.npz` and `checkpoint_metadata.npz`. Evaluation refuses to mix incompatible artifacts, including mismatched `model_variant`, `context_size`, `input_shape`, `normalization_strategy`, `data_generator_interface_version`, `tf_seq_len`, `fusion_boundary_shape`, or train/test/validation group IDs. If these checks fail, regenerate the fold under the correct variant directory instead of reusing old `Kfold_models/fold*` artifacts.
 
 ## File Naming

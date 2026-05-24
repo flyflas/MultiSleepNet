@@ -18,6 +18,12 @@ from model import Transformer
 from data_loader import data_generator
 from config import Config, Path
 from mlflow_utils import MLflowTracker
+from experiment_reporting import (
+    build_experiment_metadata,
+    count_model_parameters,
+    write_experiment_report,
+    write_metrics_summary_csv,
+)
 from compatibility import (
     CHECKPOINT_METADATA_FILE,
     GROUP_GRANULARITY,
@@ -120,6 +126,31 @@ def save_evaluation_artifacts(confusion_mat, class_wise_result, output_dir):
         f.write('\n')
 
     return [confusion_path, class_wise_path, class_wise_csv_path]
+
+
+def metrics_summary_row(metadata, metrics, scope, fold=''):
+    return {
+        'scope': scope,
+        'fold': fold,
+        'model_variant': metadata['model_variant'],
+        'experiment_name': metadata['experiment_name'],
+        'context_window': metadata['context_window'],
+        'uses_future_epochs': metadata['uses_future_epochs'],
+        'split_level': metadata['split_level'],
+        'split_granularity': metadata['split_granularity'],
+        'normalization_strategy': metadata['normalization_strategy'],
+        'batch_size': metadata['batch_size'],
+        'input_shape': metadata['input_shape'],
+        'model_parameter_count': metadata['model_parameter_count'],
+        'accuracy': metrics['accuracy'],
+        'kappa': metrics['kappa'],
+        'macro_f1': metrics['macro_f1'],
+        'weighted_f1': metrics['weighted_f1'],
+        'sensitivity_macro_recall': metrics['sensitivity_macro_recall'],
+        'specificity': metrics['specificity'],
+        'balanced_accuracy': metrics['balanced_accuracy'],
+        'metrics_scope_warning': metadata['metrics_scope_warning'],
+    }
 
 
 def find_trained_fold_dirs(root='./Kfold_models'):
@@ -469,6 +500,7 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
     )
 
     model = Transformer(config).to(config.device)
+    model_parameter_count = count_model_parameters(model)
     model.load_state_dict(torch.load(path_model, map_location=config.device), strict=True)
 
     result = test(model, test_loader, config)
@@ -476,7 +508,7 @@ def evaluate_single_fold(config, dataset, labels, fold, test_idx):
     del model
     torch.cuda.empty_cache()
 
-    return result
+    return result + (model_parameter_count,)
 
 
 def evaluate(config, path, tracker=None):
@@ -529,6 +561,8 @@ def evaluate(config, path, tracker=None):
         Confusion_mat = np.zeros([5, 5], dtype=np.float64)
 
         valid_folds = []
+        summary_rows = []
+        model_parameter_count = None
 
         trained_folds = find_trained_fold_dirs(root=checkpoint_root(config))
         if len(trained_folds) == 0:
@@ -557,8 +591,11 @@ def evaluate(config, path, tracker=None):
                 average_specificity,
                 balanced_acc,
                 con_mat,
-                class_wise_fold
+                class_wise_fold,
+                fold_model_parameter_count
             ) = evaluate_single_fold(config, dataset, labels, fold, test_idx)
+            if model_parameter_count is None:
+                model_parameter_count = fold_model_parameter_count
 
             tracker.log_metrics({
                 f'fold_{fold}_acc': accuracy,
@@ -572,6 +609,31 @@ def evaluate(config, path, tracker=None):
 
             fold_artifact_dir = os.path.join(get_fold_dir(config, fold), 'evaluation')
             fold_artifacts = save_evaluation_artifacts(con_mat, class_wise_fold, output_dir=fold_artifact_dir)
+            fold_metrics = {
+                'accuracy': accuracy,
+                'kappa': cohens_kappa,
+                'macro_f1': macro_f1,
+                'weighted_f1': weighted_f1,
+                'sensitivity_macro_recall': average_sensitivity,
+                'specificity': average_specificity,
+                'balanced_accuracy': balanced_acc,
+            }
+            fold_report_metadata = build_experiment_metadata(
+                config,
+                dataset,
+                stage='evaluate_fold',
+                model_parameter_count=fold_model_parameter_count,
+                fold=fold,
+                metrics=fold_metrics,
+                sizes={
+                    'test_size': len(test_idx),
+                    'test_group_count': len(np.unique(np.asarray(groups, dtype=str)[test_idx])),
+                },
+            )
+            fold_artifacts.extend(
+                write_experiment_report(fold_artifact_dir, fold_report_metadata, prefix='evaluation_report')
+            )
+            summary_rows.append(metrics_summary_row(fold_report_metadata, fold_metrics, scope='fold', fold=fold))
             for artifact_path in fold_artifacts:
                 tracker.log_artifact(artifact_path, artifact_path=f'fold{fold}/evaluation')
 
@@ -616,6 +678,36 @@ def evaluate(config, path, tracker=None):
             class_wise_result,
             output_dir=evaluation_dir(config),
         )
+        aggregate_metrics = {
+            'accuracy': ACC,
+            'kappa': Kappa,
+            'macro_f1': MF1,
+            'weighted_f1': WF1,
+            'sensitivity_macro_recall': Sens,
+            'specificity': Spec,
+            'balanced_accuracy': Bal_ACC,
+            'num_valid_folds': num_valid,
+        }
+        aggregate_report_metadata = build_experiment_metadata(
+            config,
+            dataset,
+            stage='evaluate_summary',
+            model_parameter_count=model_parameter_count,
+            metrics=aggregate_metrics,
+            sizes={
+                'dataset_size': len(labels),
+                'train_test_dataset_shape': tuple(dataset.shape),
+                'groups_shape': tuple(groups.shape),
+                'window_meta_rows': len(window_meta),
+                'val_window_meta_rows': len(val_window_meta),
+                'valid_folds': valid_folds,
+            },
+        )
+        artifact_paths.extend(
+            write_experiment_report(evaluation_dir(config), aggregate_report_metadata, prefix='evaluation_summary')
+        )
+        summary_rows.append(metrics_summary_row(aggregate_report_metadata, aggregate_metrics, scope='mean'))
+        artifact_paths.append(write_metrics_summary_csv(evaluation_dir(config), summary_rows))
         for artifact_path in artifact_paths:
             tracker.log_artifact(artifact_path, artifact_path='evaluation')
 
