@@ -46,9 +46,9 @@ class EarlyStopping:
         self.early_stop = False
 
         if self.mode == 'max':
-            self.best_metric = -np.Inf
+            self.best_metric = -np.inf
         else:
-            self.best_metric = np.Inf
+            self.best_metric = np.inf
 
     def __call__(self, metric_value, model, path):
         """
