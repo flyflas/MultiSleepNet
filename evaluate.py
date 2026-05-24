@@ -24,6 +24,10 @@ CLASS_NAMES = ['Wake', 'N1', 'N2', 'N3', 'REM']
 SPLIT_METADATA_FILE = 'split_metadata.npz'
 SPLIT_RANDOM_STATE = 0
 SPLIT_SHUFFLE = True
+GROUP_GRANULARITY = 'subject_id'
+CONTEXT_SIZE = 5
+LEFT_CONTEXT = 2
+RIGHT_CONTEXT = 2
 
 
 def specificity(y_true, y_pred, n=5):
@@ -138,7 +142,52 @@ def split_window_identity(window_meta, indices):
     return sample_ids, subject_ids, center_epoch_indices, labels
 
 
-def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, window_meta=None):
+def unique_group_ids(groups):
+    return np.unique(np.asarray(groups, dtype=str))
+
+
+def group_ids_from_window_meta(window_meta):
+    return unique_group_ids([meta[GROUP_GRANULARITY] for meta in window_meta])
+
+
+def assert_disjoint_group_ids(group_sets, split_name):
+    normalized = {
+        name: set(np.asarray(group_ids, dtype=str).tolist())
+        for name, group_ids in group_sets.items()
+    }
+    names = list(normalized)
+    for index, left_name in enumerate(names):
+        for right_name in names[index + 1:]:
+            overlap = sorted(normalized[left_name] & normalized[right_name])
+            if overlap:
+                raise RuntimeError(
+                    f'[ERROR] {split_name} group leakage between {left_name} and {right_name}: '
+                    f'{GROUP_GRANULARITY} overlap={overlap[:10]}'
+                )
+
+
+def assert_group_split_integrity(train_idx, test_idx, groups, val_window_meta=None, split_name='split'):
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    test_idx = np.asarray(test_idx, dtype=np.int64)
+    if np.intersect1d(train_idx, test_idx).size > 0:
+        raise RuntimeError(f'[ERROR] {split_name} train/test indices overlap.')
+    if not np.array_equal(np.sort(np.concatenate([train_idx, test_idx])), np.arange(len(groups))):
+        raise RuntimeError(f'[ERROR] {split_name} train/test indices do not cover the train_test dataset exactly once.')
+
+    groups = np.asarray(groups, dtype=str)
+    train_group_ids = unique_group_ids(groups[train_idx])
+    test_group_ids = unique_group_ids(groups[test_idx])
+    group_sets = {
+        'train': train_group_ids,
+        'test': test_group_ids,
+    }
+    if val_window_meta is not None:
+        group_sets['validation'] = group_ids_from_window_meta(val_window_meta)
+    assert_disjoint_group_ids(group_sets, split_name)
+    return train_group_ids, test_group_ids, group_sets.get('validation', np.asarray([], dtype=str))
+
+
+def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, window_meta=None, val_window_meta=None):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
         raise RuntimeError(
@@ -165,6 +214,9 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
             'groups_shape',
             'train_groups',
             'test_groups',
+            'train_group_ids',
+            'test_group_ids',
+            'validation_group_ids',
             'group_granularity',
             'group_split_enforced',
         })
@@ -241,15 +293,28 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
 
     if groups is not None:
         groups = np.asarray(groups)
+        train_group_ids, test_group_ids, validation_group_ids = assert_group_split_integrity(
+            train_idx,
+            test_idx,
+            groups,
+            val_window_meta=val_window_meta,
+            split_name=f'fold {fold}',
+        )
         if not np.array_equal(metadata['groups_shape'], np.asarray(groups.shape, dtype=np.int64)):
             raise RuntimeError(f'[ERROR] fold {fold} groups shape mismatch in split metadata.')
         if not np.array_equal(metadata['train_groups'].astype(str), groups[train_idx].astype(str)):
             raise RuntimeError(f'[ERROR] fold {fold} train group identity mismatch in split metadata.')
         if not np.array_equal(metadata['test_groups'].astype(str), groups[test_idx].astype(str)):
             raise RuntimeError(f'[ERROR] fold {fold} test group identity mismatch in split metadata.')
-        if str(np.asarray(metadata['group_granularity']).item()) != 'subject_id':
+        if not np.array_equal(metadata['train_group_ids'].astype(str), train_group_ids):
+            raise RuntimeError(f'[ERROR] fold {fold} train group IDs mismatch in split metadata.')
+        if not np.array_equal(metadata['test_group_ids'].astype(str), test_group_ids):
+            raise RuntimeError(f'[ERROR] fold {fold} test group IDs mismatch in split metadata.')
+        if not np.array_equal(metadata['validation_group_ids'].astype(str), validation_group_ids):
+            raise RuntimeError(f'[ERROR] fold {fold} validation group IDs mismatch in split metadata.')
+        if str(np.asarray(metadata['group_granularity']).item()) != GROUP_GRANULARITY:
             raise RuntimeError(f'[ERROR] fold {fold} group granularity mismatch in split metadata.')
-        if bool(metadata['group_split_enforced']) is not False:
+        if bool(metadata['group_split_enforced']) is not True:
             raise RuntimeError(f'[ERROR] fold {fold} group split flag mismatch in split metadata.')
 
     if dataset.dim() == 5:
@@ -262,9 +327,9 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
             test_idx
         )
         context_checks = {
-            'context_size': int(metadata['context_size']) == 5,
-            'left_context': int(metadata['left_context']) == 2,
-            'right_context': int(metadata['right_context']) == 2,
+            'context_size': int(metadata['context_size']) == CONTEXT_SIZE,
+            'left_context': int(metadata['left_context']) == LEFT_CONTEXT,
+            'right_context': int(metadata['right_context']) == RIGHT_CONTEXT,
             'train_sample_ids': np.array_equal(metadata['train_sample_ids'].astype(str), train_sample_ids),
             'test_sample_ids': np.array_equal(metadata['test_sample_ids'].astype(str), test_sample_ids),
             'train_subject_ids': np.array_equal(metadata['train_subject_ids'].astype(str), train_subject_ids),
@@ -411,7 +476,16 @@ def evaluate(config, path, tracker=None):
             raise RuntimeError('[ERROR] No trained fold models found.')
 
         for fold, fold_dir in trained_folds:
-            test_idx = load_split_metadata(fold, fold_dir, config, dataset, labels, groups, window_meta)
+            test_idx = load_split_metadata(
+                fold,
+                fold_dir,
+                config,
+                dataset,
+                labels,
+                groups,
+                window_meta,
+                val_window_meta,
+            )
 
             print('\n' + '-' * 15, '>', f'Fold {fold}', '<', '-' * 15)
 

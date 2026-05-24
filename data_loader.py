@@ -5,7 +5,7 @@ import numpy as np
 
 import torch
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 from config import Config
 
@@ -23,6 +23,8 @@ TF_METADATA_FIELDS = [
 SLEEP_EDF_SUBJECT_RE = re.compile(r'^[A-Za-z]{2}\d{4}')
 CONTEXT_SIZE = 5
 CONTEXT_RADIUS = CONTEXT_SIZE // 2
+GROUP_GRANULARITY = 'subject_id'
+SPLIT_RANDOM_STATE = 0
 
 
 def infer_subject_id_from_sample_id(sample_id):
@@ -79,6 +81,59 @@ def assert_context_dataset_shape(dataset, labels, split_name='context dataset'):
         raise ValueError(
             f'[ERROR] {split_name} dataset size ({len(dataset)}) != labels size ({len(labels)})'
         )
+
+
+def assert_disjoint_groups(train_groups, val_groups, split_name='validation'):
+    """Ensure no subject-level group appears on both sides of a split."""
+    train_group_ids = set(np.asarray(train_groups, dtype=str).tolist())
+    val_group_ids = set(np.asarray(val_groups, dtype=str).tolist())
+    overlap = sorted(train_group_ids & val_group_ids)
+    if overlap:
+        raise ValueError(
+            f'[ERROR] {split_name} group split leakage: '
+            f'{GROUP_GRANULARITY} overlap between train/test and validation: {overlap[:10]}'
+        )
+
+
+def select_window_meta(window_meta, indices):
+    return [window_meta[int(index)] for index in indices]
+
+
+def group_train_validation_split(dataset, labels, groups, window_meta, val_ratio):
+    """Split context windows by subject so all windows for one subject stay together."""
+    group_array = np.asarray(groups, dtype=object)
+    unique_groups = np.unique(group_array.astype(str))
+    if len(unique_groups) < 2:
+        raise ValueError(
+            f'[ERROR] Need at least 2 unique {GROUP_GRANULARITY} groups for held-out validation, '
+            f'got {len(unique_groups)}.'
+        )
+
+    splitter = GroupShuffleSplit(
+        n_splits=1,
+        test_size=val_ratio,
+        random_state=SPLIT_RANDOM_STATE,
+    )
+    split_input = np.arange(len(labels))
+    train_idx, val_idx = next(splitter.split(split_input, labels.cpu().numpy(), group_array.astype(str)))
+
+    groups_train_test = group_array[train_idx]
+    groups_val = group_array[val_idx]
+    assert_disjoint_groups(groups_train_test, groups_val)
+
+    meta_train_test = select_window_meta(window_meta, train_idx)
+    meta_val = select_window_meta(window_meta, val_idx)
+
+    return (
+        dataset[train_idx],
+        dataset[val_idx],
+        labels[train_idx],
+        labels[val_idx],
+        groups_train_test,
+        groups_val,
+        meta_train_test,
+        meta_val,
+    )
 
 
 def build_context_windows_for_file(path_dataset, row):
@@ -324,15 +379,12 @@ def data_generator(path_labels, path_dataset):
 
     print_label_distribution(labels, split_name='full context dataset')
 
-    X_train_test, X_val, y_train_test, y_val, groups_train_test, groups_val, meta_train_test, meta_val = train_test_split(
+    X_train_test, X_val, y_train_test, y_val, groups_train_test, groups_val, meta_train_test, meta_val = group_train_validation_split(
         dataset,
         labels,
         groups,
         window_meta,
-        # This test_size is the held-out validation ratio, not the K-fold test ratio.
-        test_size=config.val_ratio,
-        random_state=0,
-        stratify=labels
+        val_ratio=config.val_ratio,
     )
 
     assert_context_dataset_shape(X_train_test, y_train_test, split_name='train_test context dataset')
@@ -342,6 +394,8 @@ def data_generator(path_labels, path_dataset):
     print(f'[INFO] val context size: {len(X_val)}')
     print(f'[INFO] train_test unique groups: {len(set(groups_train_test))}')
     print(f'[INFO] val unique groups: {len(set(groups_val))}')
+    print(f'[INFO] group granularity: {GROUP_GRANULARITY}')
+    print('[INFO] held-out validation split is group-aware and uses disjoint subject_id groups.')
 
     print_label_distribution(y_train_test, split_name='train_test context')
     print_label_distribution(y_val, split_name='val context')
@@ -366,58 +420,3 @@ if __name__ == '__main__':
 
     path = Path()
     data_generator(path_labels=path.path_labels, path_dataset=path.path_TF)
-
-
-
-'''
-import os
-import numpy as np
-
-import torch
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.model_selection import train_test_split
-
-from config import Config, Path
-
-
-def data_generator(path_labels, path_dataset):
-    config = Config()
-    dir_annotation = os.listdir(path_labels)
-
-    first = True
-    for f in dir_annotation:
-        if first:
-            labels = np.load(os.path.join(path_labels, f))
-            first = False
-        else:
-            temp = np.load(os.path.join(path_labels, f))
-            labels = np.append(labels, temp, axis=0)
-    labels = torch.from_numpy(labels)
-
-    dataset_EEG_FpzCz = np.load(os.path.join(path_dataset, 'TF_EEG_Fpz-Cz_mean_std.npy')).astype('float32')
-    dataset_EEG_PzOz = np.load(os.path.join(path_dataset, 'TF_EEG_Pz-Oz_mean_std.npy')).astype('float32')
-    dataset_EOG = np.load(os.path.join(path_dataset, 'TF_EOG_mean_std.npy')).astype('float32')
-
-    dataset = np.stack((dataset_EEG_FpzCz, dataset_EEG_PzOz, dataset_EOG), axis=1)
-    dataset = torch.from_numpy(dataset)
-
-    print('dataset: ', dataset.shape)
-
-    # hold out the validation set
-    X_train_test, X_val, y_train_test, y_val = train_test_split(dataset, labels, test_size=1/(config.num_fold+1), random_state=0, stratify=labels)
-
-    val_set = TensorDataset(X_val, y_val)
-    #val_loader = DataLoader(dataset=val_set, batch_size=config.batch_size, shuffle=False)
-    val_loader = DataLoader(
-        dataset=val_set,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
-
-    print('val_set:', len(X_val))
-    return X_train_test, y_train_test, val_loader
-'''

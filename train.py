@@ -8,7 +8,7 @@ from torch import nn
 from torch import optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import accuracy_score
 
 from model import Transformer
@@ -21,6 +21,10 @@ from mlflow_utils import MLflowTracker
 SPLIT_METADATA_FILE = 'split_metadata.npz'
 SPLIT_RANDOM_STATE = 0
 SPLIT_SHUFFLE = True
+GROUP_GRANULARITY = 'subject_id'
+CONTEXT_SIZE = 5
+LEFT_CONTEXT = 2
+RIGHT_CONTEXT = 2
 
 
 def set_random_seed(seed=0):
@@ -98,6 +102,51 @@ def split_window_identity(window_meta, indices):
     return sample_ids, subject_ids, center_epoch_indices, labels
 
 
+def unique_group_ids(groups):
+    return np.unique(np.asarray(groups, dtype=str))
+
+
+def group_ids_from_window_meta(window_meta):
+    return unique_group_ids([meta[GROUP_GRANULARITY] for meta in window_meta])
+
+
+def assert_disjoint_group_ids(group_sets, split_name):
+    normalized = {
+        name: set(np.asarray(group_ids, dtype=str).tolist())
+        for name, group_ids in group_sets.items()
+    }
+    names = list(normalized)
+    for index, left_name in enumerate(names):
+        for right_name in names[index + 1:]:
+            overlap = sorted(normalized[left_name] & normalized[right_name])
+            if overlap:
+                raise RuntimeError(
+                    f'[ERROR] {split_name} group leakage between {left_name} and {right_name}: '
+                    f'{GROUP_GRANULARITY} overlap={overlap[:10]}'
+                )
+
+
+def assert_group_split_integrity(train_idx, test_idx, groups, val_window_meta=None, split_name='split'):
+    train_idx = np.asarray(train_idx, dtype=np.int64)
+    test_idx = np.asarray(test_idx, dtype=np.int64)
+    if np.intersect1d(train_idx, test_idx).size > 0:
+        raise RuntimeError(f'[ERROR] {split_name} train/test indices overlap.')
+    if not np.array_equal(np.sort(np.concatenate([train_idx, test_idx])), np.arange(len(groups))):
+        raise RuntimeError(f'[ERROR] {split_name} train/test indices do not cover the train_test dataset exactly once.')
+
+    groups = np.asarray(groups, dtype=str)
+    train_group_ids = unique_group_ids(groups[train_idx])
+    test_group_ids = unique_group_ids(groups[test_idx])
+    group_sets = {
+        'train': train_group_ids,
+        'test': test_group_ids,
+    }
+    if val_window_meta is not None:
+        group_sets['validation'] = group_ids_from_window_meta(val_window_meta)
+    assert_disjoint_group_ids(group_sets, split_name)
+    return train_group_ids, test_group_ids, group_sets.get('validation', np.asarray([], dtype=str))
+
+
 def assert_model_supports_dataset_shape(dataset):
     if dataset.dim() == 5:
         raise RuntimeError(
@@ -111,7 +160,30 @@ def assert_model_supports_dataset_shape(dataset):
         )
 
 
-def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels, groups=None, window_meta=None):
+def save_split_metadata(
+    fold_dir,
+    fold,
+    config,
+    train_idx,
+    test_idx,
+    dataset,
+    labels,
+    groups=None,
+    window_meta=None,
+    val_window_meta=None,
+):
+    train_group_ids = np.asarray([], dtype=str)
+    test_group_ids = np.asarray([], dtype=str)
+    validation_group_ids = np.asarray([], dtype=str)
+    if groups is not None:
+        train_group_ids, test_group_ids, validation_group_ids = assert_group_split_integrity(
+            train_idx,
+            test_idx,
+            groups,
+            val_window_meta=val_window_meta,
+            split_name=f'fold {fold}',
+        )
+
     metadata = {
         'fold_index': np.array(fold, dtype=np.int64),
         'num_fold': np.array(config.num_fold, dtype=np.int64),
@@ -132,8 +204,11 @@ def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, la
             'groups_shape': np.asarray(groups.shape, dtype=np.int64),
             'train_groups': groups[np.asarray(train_idx, dtype=np.int64)].astype(str),
             'test_groups': groups[np.asarray(test_idx, dtype=np.int64)].astype(str),
-            'group_granularity': np.array('subject_id'),
-            'group_split_enforced': np.array(False, dtype=np.bool_),
+            'train_group_ids': train_group_ids,
+            'test_group_ids': test_group_ids,
+            'validation_group_ids': validation_group_ids,
+            'group_granularity': np.array(GROUP_GRANULARITY),
+            'group_split_enforced': np.array(True, dtype=np.bool_),
         })
 
     if window_meta is not None:
@@ -146,9 +221,9 @@ def save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, la
             test_idx
         )
         metadata.update({
-            'context_size': np.array(5, dtype=np.int64),
-            'left_context': np.array(2, dtype=np.int64),
-            'right_context': np.array(2, dtype=np.int64),
+            'context_size': np.array(CONTEXT_SIZE, dtype=np.int64),
+            'left_context': np.array(LEFT_CONTEXT, dtype=np.int64),
+            'right_context': np.array(RIGHT_CONTEXT, dtype=np.int64),
             'train_sample_ids': train_sample_ids,
             'test_sample_ids': test_sample_ids,
             'train_subject_ids': train_subject_ids,
@@ -175,6 +250,7 @@ def validate_existing_split_metadata(
     labels,
     groups=None,
     window_meta=None,
+    val_window_meta=None,
 ):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
@@ -202,6 +278,9 @@ def validate_existing_split_metadata(
             'groups_shape',
             'train_groups',
             'test_groups',
+            'train_group_ids',
+            'test_group_ids',
+            'validation_group_ids',
             'group_granularity',
             'group_split_enforced',
         })
@@ -251,6 +330,13 @@ def validate_existing_split_metadata(
     }
     if groups is not None:
         groups = np.asarray(groups)
+        train_group_ids, test_group_ids, validation_group_ids = assert_group_split_integrity(
+            train_idx,
+            test_idx,
+            groups,
+            val_window_meta=val_window_meta,
+            split_name=f'existing fold {fold}',
+        )
         checks.update({
             'groups_shape': np.array_equal(metadata['groups_shape'], np.asarray(groups.shape, dtype=np.int64)),
             'train_groups': np.array_equal(
@@ -261,8 +347,14 @@ def validate_existing_split_metadata(
                 metadata['test_groups'],
                 groups[np.asarray(test_idx, dtype=np.int64)].astype(str)
             ),
-            'group_granularity': str(np.asarray(metadata['group_granularity']).item()) == 'subject_id',
-            'group_split_enforced': bool(metadata['group_split_enforced']) is False,
+            'train_group_ids': np.array_equal(metadata['train_group_ids'].astype(str), train_group_ids),
+            'test_group_ids': np.array_equal(metadata['test_group_ids'].astype(str), test_group_ids),
+            'validation_group_ids': np.array_equal(
+                metadata['validation_group_ids'].astype(str),
+                validation_group_ids,
+            ),
+            'group_granularity': str(np.asarray(metadata['group_granularity']).item()) == GROUP_GRANULARITY,
+            'group_split_enforced': bool(metadata['group_split_enforced']) is True,
         })
     if dataset.dim() == 5:
         train_sample_ids, train_subject_ids, train_center_epoch_indices, train_window_labels = split_window_identity(
@@ -274,9 +366,9 @@ def validate_existing_split_metadata(
             test_idx
         )
         checks.update({
-            'context_size': int(metadata['context_size']) == 5,
-            'left_context': int(metadata['left_context']) == 2,
-            'right_context': int(metadata['right_context']) == 2,
+            'context_size': int(metadata['context_size']) == CONTEXT_SIZE,
+            'left_context': int(metadata['left_context']) == LEFT_CONTEXT,
+            'right_context': int(metadata['right_context']) == RIGHT_CONTEXT,
             'train_sample_ids': np.array_equal(metadata['train_sample_ids'].astype(str), train_sample_ids),
             'test_sample_ids': np.array_equal(metadata['test_sample_ids'].astype(str), test_sample_ids),
             'train_subject_ids': np.array_equal(metadata['train_subject_ids'].astype(str), train_subject_ids),
@@ -422,7 +514,7 @@ def train(save_all_checkpoint=False, start_fold=None):
     print_label_distribution(labels, split_name='full dataset')
     assert_model_supports_dataset_shape(dataset)
 
-    kf = StratifiedKFold(
+    kf = StratifiedGroupKFold(
         n_splits=config.num_fold,
         shuffle=True,
         random_state=SPLIT_RANDOM_STATE
@@ -451,16 +543,22 @@ def train(save_all_checkpoint=False, start_fold=None):
             'max_folds_to_run': config.max_folds_to_run,
             'save_all_checkpoint': save_all_checkpoint,
             'start_fold': start_fold,
-            'context_size': 5,
-            'group_granularity': 'subject_id',
-            'group_split_enforced': False,
+            'context_size': CONTEXT_SIZE,
+            'left_context': LEFT_CONTEXT,
+            'right_context': RIGHT_CONTEXT,
+            'group_granularity': GROUP_GRANULARITY,
+            'group_split_enforced': True,
         })
         tracker.log_params({f'full_distribution_{k}': v for k, v in label_distribution(labels).items()})
 
         any_fold_trained = False
         newly_trained_folds = 0
 
-        for fold, (train_idx, test_idx) in enumerate(kf.split(dataset, labels)):
+        split_input = np.arange(len(labels))
+        split_labels = labels.cpu().numpy() if isinstance(labels, torch.Tensor) else np.asarray(labels)
+        split_groups = np.asarray(groups, dtype=str)
+
+        for fold, (train_idx, test_idx) in enumerate(kf.split(split_input, split_labels, split_groups)):
             fold_dir = f'./Kfold_models/fold{fold}'
             os.makedirs(fold_dir, exist_ok=True)
 
@@ -477,6 +575,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                         labels,
                         groups,
                         window_meta,
+                        val_window_meta,
                     )
                 print(f'[INFO] Skip fold {fold} (before start_fold={start_fold}).')
                 continue
@@ -493,6 +592,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                     labels,
                     groups,
                     window_meta,
+                    val_window_meta,
                 )
                 print(f'[INFO] Skip fold {fold} (already finished).')
                 continue
@@ -509,6 +609,7 @@ def train(save_all_checkpoint=False, start_fold=None):
                     labels,
                     groups,
                     window_meta,
+                    val_window_meta,
                 )
             elif has_fold_outputs(fold_dir):
                 raise RuntimeError(
@@ -530,15 +631,34 @@ def train(save_all_checkpoint=False, start_fold=None):
 
             print('\n' + '-' * 15 + f' > Fold {fold} < ' + '-' * 15)
 
+            train_group_ids, test_group_ids, validation_group_ids = assert_group_split_integrity(
+                train_idx,
+                test_idx,
+                groups,
+                val_window_meta=val_window_meta,
+                split_name=f'fold {fold}',
+            )
             X_train, X_test = dataset[train_idx], dataset[test_idx]
             y_train, y_test = labels[train_idx], labels[test_idx]
-            save_split_metadata(fold_dir, fold, config, train_idx, test_idx, dataset, labels, groups, window_meta)
+            save_split_metadata(
+                fold_dir,
+                fold,
+                config,
+                train_idx,
+                test_idx,
+                dataset,
+                labels,
+                groups,
+                window_meta,
+                val_window_meta,
+            )
 
             print(f'[INFO][fold {fold}] X_train shape = {X_train.shape}, y_train shape = {y_train.shape}')
             print(f'[INFO][fold {fold}] X_test  shape = {X_test.shape}, y_test  shape = {y_test.shape}')
             print(
-                f'[INFO][fold {fold}] group-aware split is not enforced in Milestone 3; '
-                'groups are preserved for Milestone 4.'
+                f'[INFO][fold {fold}] group-aware split enforced at {GROUP_GRANULARITY} granularity: '
+                f'train_groups={len(train_group_ids)}, test_groups={len(test_group_ids)}, '
+                f'validation_groups={len(validation_group_ids)}.'
             )
 
             print_label_distribution(y_train, split_name=f'fold {fold} train')
