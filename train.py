@@ -22,9 +22,6 @@ SPLIT_METADATA_FILE = 'split_metadata.npz'
 SPLIT_RANDOM_STATE = 0
 SPLIT_SHUFFLE = True
 GROUP_GRANULARITY = 'subject_id'
-CONTEXT_SIZE = 5
-LEFT_CONTEXT = 2
-RIGHT_CONTEXT = 2
 
 
 def set_random_seed(seed=0):
@@ -66,6 +63,10 @@ def log_config_params(tracker, config):
         'num_epochs': config.num_epochs,
         'batch_size': config.batch_size,
         'pad_size': config.pad_size,
+        'tf_seq_len': config.tf_seq_len,
+        'context_size': config.context_size,
+        'left_context': config.left_context,
+        'right_context': config.right_context,
         'learning_rate': config.learning_rate,
         'dropout': config.dropout,
         'dim_model': config.dim_model,
@@ -73,6 +74,7 @@ def log_config_params(tracker, config):
         'fc_hidden': config.fc_hidden,
         'num_head': config.num_head,
         'num_encoder': config.num_encoder,
+        'num_encoder_context': config.num_encoder_context,
         'num_encoder_multi': config.num_encoder_multi,
         'use_positional_encoding': config.use_positional_encoding,
         'mamba_d_state': config.mamba_d_state,
@@ -147,16 +149,19 @@ def assert_group_split_integrity(train_idx, test_idx, groups, val_window_meta=No
     return train_group_ids, test_group_ids, group_sets.get('validation', np.asarray([], dtype=str))
 
 
-def assert_model_supports_dataset_shape(dataset):
+def assert_model_supports_dataset_shape(dataset, config):
     if dataset.dim() == 5:
-        raise RuntimeError(
-            '[ERROR] Context windows were built with shape [N, 5, 3, 29, 128], '
-            'but the current Transformer still expects [N, 3, 29, 128]. '
-            'Milestone 5 must update model.py before context training can run.'
-        )
-    if dataset.dim() != 4:
+        expected_tail = (config.context_size, 3, config.tf_seq_len, config.dim_model)
+    elif dataset.dim() == 4:
+        expected_tail = (3, config.tf_seq_len, config.dim_model)
+    else:
         raise RuntimeError(
             f'[ERROR] Unsupported dataset rank {dataset.dim()} for training: shape={tuple(dataset.shape)}'
+        )
+    if tuple(dataset.shape[1:]) != expected_tail:
+        raise RuntimeError(
+            f'[ERROR] Unsupported dataset shape for training: expected [N, {", ".join(map(str, expected_tail))}], '
+            f'got {tuple(dataset.shape)}'
         )
 
 
@@ -221,9 +226,9 @@ def save_split_metadata(
             test_idx
         )
         metadata.update({
-            'context_size': np.array(CONTEXT_SIZE, dtype=np.int64),
-            'left_context': np.array(LEFT_CONTEXT, dtype=np.int64),
-            'right_context': np.array(RIGHT_CONTEXT, dtype=np.int64),
+            'context_size': np.array(config.context_size, dtype=np.int64),
+            'left_context': np.array(config.left_context, dtype=np.int64),
+            'right_context': np.array(config.right_context, dtype=np.int64),
             'train_sample_ids': train_sample_ids,
             'test_sample_ids': test_sample_ids,
             'train_subject_ids': train_subject_ids,
@@ -366,9 +371,9 @@ def validate_existing_split_metadata(
             test_idx
         )
         checks.update({
-            'context_size': int(metadata['context_size']) == CONTEXT_SIZE,
-            'left_context': int(metadata['left_context']) == LEFT_CONTEXT,
-            'right_context': int(metadata['right_context']) == RIGHT_CONTEXT,
+            'context_size': int(metadata['context_size']) == config.context_size,
+            'left_context': int(metadata['left_context']) == config.left_context,
+            'right_context': int(metadata['right_context']) == config.right_context,
             'train_sample_ids': np.array_equal(metadata['train_sample_ids'].astype(str), train_sample_ids),
             'test_sample_ids': np.array_equal(metadata['test_sample_ids'].astype(str), test_sample_ids),
             'train_subject_ids': np.array_equal(metadata['train_subject_ids'].astype(str), train_subject_ids),
@@ -512,7 +517,7 @@ def train(save_all_checkpoint=False, start_fold=None):
     print(f'[INFO] window metadata rows: {len(window_meta)}')
     print(f'[INFO] val window metadata rows: {len(val_window_meta)}')
     print_label_distribution(labels, split_name='full dataset')
-    assert_model_supports_dataset_shape(dataset)
+    assert_model_supports_dataset_shape(dataset, config)
 
     kf = StratifiedGroupKFold(
         n_splits=config.num_fold,
@@ -543,9 +548,9 @@ def train(save_all_checkpoint=False, start_fold=None):
             'max_folds_to_run': config.max_folds_to_run,
             'save_all_checkpoint': save_all_checkpoint,
             'start_fold': start_fold,
-            'context_size': CONTEXT_SIZE,
-            'left_context': LEFT_CONTEXT,
-            'right_context': RIGHT_CONTEXT,
+            'context_size': config.context_size,
+            'left_context': config.left_context,
+            'right_context': config.right_context,
             'group_granularity': GROUP_GRANULARITY,
             'group_split_enforced': True,
         })

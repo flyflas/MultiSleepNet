@@ -25,9 +25,6 @@ SPLIT_METADATA_FILE = 'split_metadata.npz'
 SPLIT_RANDOM_STATE = 0
 SPLIT_SHUFFLE = True
 GROUP_GRANULARITY = 'subject_id'
-CONTEXT_SIZE = 5
-LEFT_CONTEXT = 2
-RIGHT_CONTEXT = 2
 
 
 def specificity(y_true, y_pred, n=5):
@@ -187,6 +184,22 @@ def assert_group_split_integrity(train_idx, test_idx, groups, val_window_meta=No
     return train_group_ids, test_group_ids, group_sets.get('validation', np.asarray([], dtype=str))
 
 
+def assert_model_supports_dataset_shape(dataset, config):
+    if dataset.dim() == 5:
+        expected_tail = (config.context_size, 3, config.tf_seq_len, config.dim_model)
+    elif dataset.dim() == 4:
+        expected_tail = (3, config.tf_seq_len, config.dim_model)
+    else:
+        raise RuntimeError(
+            f'[ERROR] Unsupported dataset rank {dataset.dim()} for evaluation: shape={tuple(dataset.shape)}'
+        )
+    if tuple(dataset.shape[1:]) != expected_tail:
+        raise RuntimeError(
+            f'[ERROR] Unsupported dataset shape for evaluation: expected [N, {", ".join(map(str, expected_tail))}], '
+            f'got {tuple(dataset.shape)}'
+        )
+
+
 def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, window_meta=None, val_window_meta=None):
     metadata_path = os.path.join(fold_dir, SPLIT_METADATA_FILE)
     if not os.path.exists(metadata_path):
@@ -327,9 +340,9 @@ def load_split_metadata(fold, fold_dir, config, dataset, labels, groups=None, wi
             test_idx
         )
         context_checks = {
-            'context_size': int(metadata['context_size']) == CONTEXT_SIZE,
-            'left_context': int(metadata['left_context']) == LEFT_CONTEXT,
-            'right_context': int(metadata['right_context']) == RIGHT_CONTEXT,
+            'context_size': int(metadata['context_size']) == config.context_size,
+            'left_context': int(metadata['left_context']) == config.left_context,
+            'right_context': int(metadata['right_context']) == config.right_context,
             'train_sample_ids': np.array_equal(metadata['train_sample_ids'].astype(str), train_sample_ids),
             'test_sample_ids': np.array_equal(metadata['test_sample_ids'].astype(str), test_sample_ids),
             'train_subject_ids': np.array_equal(metadata['train_subject_ids'].astype(str), train_subject_ids),
@@ -436,12 +449,7 @@ def evaluate(config, path, tracker=None):
         path_dataset=path.path_TF
     )
 
-    if dataset.dim() == 5:
-        raise RuntimeError(
-            '[ERROR] Context windows were built with shape [N, 5, 3, 29, 128], '
-            'but evaluate.py still uses the current Transformer expecting [N, 3, 29, 128]. '
-            'Milestone 5 must update model.py before context evaluation can run.'
-        )
+    assert_model_supports_dataset_shape(dataset, config)
 
     with tracker.start_run(run_name=config.mlflow_run_name or 'evaluate') as _:
         tracker.log_params({
@@ -449,6 +457,10 @@ def evaluate(config, path, tracker=None):
             'val_ratio': config.val_ratio,
             'num_classes': config.num_classes,
             'batch_size': config.batch_size,
+            'tf_seq_len': config.tf_seq_len,
+            'context_size': config.context_size,
+            'left_context': config.left_context,
+            'right_context': config.right_context,
             'dataset_shape': tuple(dataset.shape),
             'labels_shape': tuple(labels.shape),
             'train_test_dataset_shape': tuple(dataset.shape),

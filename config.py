@@ -62,10 +62,30 @@ class Config(object):
         # model settings
         self.dropout = 0.1
         self.dim_model = 128
+        self.tf_seq_len = _get_int_env('MCSN_TF_SEQ_LEN', self.pad_size)
+        self.context_size = _get_int_env('MCSN_CONTEXT_SIZE', 5)
+        self.left_context = _get_int_env('MCSN_LEFT_CONTEXT', 2)
+        self.right_context = _get_int_env('MCSN_RIGHT_CONTEXT', 2)
+        if self.tf_seq_len <= 0:
+            raise ValueError(f'MCSN_TF_SEQ_LEN must be positive, got {self.tf_seq_len}')
+        if self.context_size <= 0:
+            raise ValueError(f'MCSN_CONTEXT_SIZE must be positive, got {self.context_size}')
+        if self.left_context < 0:
+            raise ValueError(f'MCSN_LEFT_CONTEXT must be non-negative, got {self.left_context}')
+        if self.right_context < 0:
+            raise ValueError(f'MCSN_RIGHT_CONTEXT must be non-negative, got {self.right_context}')
+        if self.left_context + 1 + self.right_context != self.context_size:
+            raise ValueError(
+                'MCSN_CONTEXT_SIZE must equal MCSN_LEFT_CONTEXT + 1 + MCSN_RIGHT_CONTEXT, '
+                f'got {self.context_size} != {self.left_context} + 1 + {self.right_context}'
+            )
         self.forward_hidden = 1024
         self.fc_hidden = 1024
         self.num_head = 8
         self.num_encoder = 16
+        self.num_encoder_context = _get_int_env('MCSN_NUM_ENCODER_CONTEXT', 1)
+        if self.num_encoder_context <= 0:
+            raise ValueError(f'MCSN_NUM_ENCODER_CONTEXT must be positive, got {self.num_encoder_context}')
         self.num_encoder_multi = 4
 
         # mamba settings
